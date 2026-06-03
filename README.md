@@ -113,6 +113,34 @@ whether a test has already been executed or not by other of their peers.
     reporting on top of it, because you can directly explore test results in
     redis. See Tests results in Redis for more info.
 
+    This value is also used as the **tombstone** TTL for completed tests:
+    once a test produces a result, its claim key is promoted to this TTL so
+    a replacement runner won't re-run it.
+
+  - **MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME** = 600
+
+    TTL (in seconds) for the in-flight claim key a runner sets when it
+    starts a test. Defaults to 10 minutes. The runner refreshes this TTL
+    every `claim_ttl / 3` seconds while the test is running, so a slow
+    test never lets its claim expire under it.
+
+    On graceful shutdown (SIGTERM / SIGINT) the runner DELs its in-flight
+    claim so a replacement pod can pick the test up immediately. On a hard
+    kill (no signal delivered) the claim auto-expires after this TTL,
+    bounding recovery time.
+
+    ### Claim key lifecycle
+
+    A test key in redis goes through three phases:
+
+    1. **In-flight** — short TTL (`MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME`),
+       refreshed by a keepalive while the test runs.
+    2. **Released on SIGTERM** — DEL'd, so another runner can re-claim it.
+    3. **Completed** — promoted to a tombstone with TTL
+       `MOCHA_DISTRIBUTED_EXPIRATION_TIME` (7 d default), matching the
+       result-list lifetime.
+
+    This makes the runner safe to use on preemptible / spot infrastructure.
 
   - **MOCHA_DISTRIBUTED_VERBOSE** = false
     - false (default)

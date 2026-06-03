@@ -18,6 +18,11 @@ const g_redisAddress = process.env.MOCHA_DISTRIBUTED || "";
 const g_testExecutionId = process.env.MOCHA_DISTRIBUTED_EXECUTION_ID || "";
 const g_expirationTime =
   process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME || `${7 * 24 * 3600}`;
+// Short TTL for in-flight claim keys; refreshed by a keepalive while a test
+// runs, DEL'd on SIGTERM, and promoted to g_expirationTime as a tombstone
+// once the test completes. See README "Claim key lifecycle".
+const g_claimExpirationTime =
+  process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME || `${10 * 60}`;
 
 // Generate a unique random id for this runner (with almost 100% certainty
 // to be different on any machine/environment).
@@ -35,6 +40,11 @@ if (g_granularity !== GRANULARITY.TEST) {
 let g_redis = null;
 
 let g_capture = { stdout: null, stderr: null };
+
+// Track the in-flight claim so we can keepalive-refresh it, tombstone it
+// after completion, and DEL it on SIGTERM.
+let g_currentClaimKey = null;
+let g_claimRefreshInterval = null;
 
 // Cache errors from intermediate retry attempts. Mocha only sets test.err via
 // the reporter on the final EVENT_TEST_FAIL; for non-final retries it emits
@@ -212,7 +222,7 @@ exports.mochaHooks = {
     // runner to get there will set the value to its own runner id.
     const [_, assignedRunnerId] = await g_redis
       .multi()
-      .set(testKey, g_runnerId, { EX: g_expirationTime, NX: true })
+      .set(testKey, g_runnerId, { EX: g_claimExpirationTime, NX: true })
       .get(testKey)
       .exec();
 
@@ -220,6 +230,16 @@ exports.mochaHooks = {
       this.currentTest.title += " (skipped by mocha_distributted)";
       this.skip();
     } else {
+      g_currentClaimKey = testKey;
+      // Refresh well inside mocha's per-test timeout so a slow test never
+      // lets its claim TTL expire while we're still running it.
+      const refreshSecs = Math.max(
+        30,
+        Math.floor(Number(g_claimExpirationTime) / 3)
+      );
+      g_claimRefreshInterval = setInterval(() => {
+        g_redis.expire(testKey, g_claimExpirationTime).catch(() => {});
+      }, refreshSecs * 1000);
       g_capture.stdout = captureStream(process.stdout);
       g_capture.stderr = captureStream(process.stderr);
     }
@@ -308,5 +328,48 @@ exports.mochaHooks = {
         .expire(countKey, g_expirationTime)
         .exec();
     }
+
+    // Stop the keepalive and promote the claim key to a tombstone matching
+    // the result-list lifetime, so a replacement pod won't re-run a test
+    // that already produced a result.
+    if (g_claimRefreshInterval) {
+      clearInterval(g_claimRefreshInterval);
+      g_claimRefreshInterval = null;
+    }
+    if (g_currentClaimKey) {
+      try {
+        await g_redis.expire(g_currentClaimKey, g_expirationTime);
+      } catch (_) {}
+      g_currentClaimKey = null;
+    }
   },
 };
+
+// -----------------------------------------------------------------------------
+// Graceful shutdown
+//
+// On SIGTERM (e.g. GKE spot preemption), release the in-flight claim so a
+// replacement pod can re-run the interrupted test. Without this the claim
+// would sit locked until g_claimExpirationTime, blocking recovery.
+// -----------------------------------------------------------------------------
+async function releaseClaimAndExit(signal) {
+  try {
+    if (g_claimRefreshInterval) {
+      clearInterval(g_claimRefreshInterval);
+      g_claimRefreshInterval = null;
+    }
+    if (g_currentClaimKey && g_redis) {
+      const owner = await g_redis.get(g_currentClaimKey);
+      if (owner === g_runnerId) {
+        await g_redis.del(g_currentClaimKey);
+      }
+    }
+  } catch (_) {}
+  try {
+    if (g_redis) await g_redis.quit();
+  } catch (_) {}
+  // 128 + signal number; SIGTERM=15, SIGINT=2
+  process.exit(signal === "SIGINT" ? 130 : 143);
+}
+process.on("SIGTERM", () => releaseClaimAndExit("SIGTERM"));
+process.on("SIGINT", () => releaseClaimAndExit("SIGINT"));

@@ -34,20 +34,20 @@ is:
   ```
 
 Make sure you have a redis running somewhere with IP visibility from the machine
-or machines where you want to run the tests on. 
+or machines where you want to run the tests on.
 
 Finally, on each of the runners just run:
 
   ```bash
     $ export MOCHA_DISTRIBUTED_EXECUTION_ID="execution__2024-01-01__20:10"
-    $ export MOCHA_DISTRIBUTED="redis://redis.address" 
+    $ export MOCHA_DISTRIBUTED="redis://redis.address"
     $ mocha --require mocha-distributed test/**/*.js
   ```
 
 There are several environment variables that allow you to control the behaviour
 of distributed tests, but this is the simplest way to launch them.
 
-MOCHA_DISTRIBUTED is the one holding the redis address, this is the only 
+MOCHA_DISTRIBUTED is the one holding the redis address, this is the only
 requirement to make mocha-distributed work.
 
 MOCHA_DISTRIBUTED_EXECUTION_ID is the other variable you want to pay attention
@@ -62,7 +62,7 @@ whether a test has already been executed or not by other of their peers.
     Right now this variable is the one used to specify the node that will hold
     information about tests being run. This project only supports redis right
     now. This variable can take the form:
-    
+
       redis[s]://[[username][:password]@][host][:port]
 
     Please make sure it has visibility to the desired redis server.
@@ -81,11 +81,11 @@ whether a test has already been executed or not by other of their peers.
     Reusing this variable in different executions will cause your tests to be
     skipped.
 
-    Use a random uuid or other random value, a kubernetes job_name, your 
+    Use a random uuid or other random value, a kubernetes job_name, your
     build system job id, ...
 
   - **MOCHA_DISTRIBUTED_GRANULARITY** = test
-  
+
     - test (default)
       Potentially all tests can be executed by any runner in any order. This
       is the default, but if you have trouble running your tests in parallel
@@ -105,7 +105,7 @@ whether a test has already been executed or not by other of their peers.
 
   - **MOCHA_DISTRIBUTED_EXPIRATION_TIME** = 604800
 
-    Configures to how long the data is kept in redis before it expires (in 
+    Configures to how long the data is kept in redis before it expires (in
     seconds). 7 days is the default. The amount of data in redis is minimal,
     so you probably don't want to play with it.
 
@@ -126,7 +126,7 @@ whether a test has already been executed or not by other of their peers.
 
 All runners write the test result in JSON format in a specific redis list.
 
-The list is basically the execution ID from the variable 
+The list is basically the execution ID from the variable
 MOCHA_DISTRIBUTED_EXECUTION_ID concatenated to ':test_result'
 
 For example, if you are using: MOCHA_DISTRIBUTED_EXECUTION_ID="abcdefg"
@@ -272,7 +272,7 @@ Run as many processes as you'd like.
 
 ### Using kubernetes parallel jobs to launch tests
 
-If you plan to use kubernetes to launch parallel jobs, make sure the backoff 
+If you plan to use kubernetes to launch parallel jobs, make sure the backoff
 limit is set to 1, so it does not retry the job after it fails, and make sure
 you set execution ID to a different value each time (but common across all
 parallel executions).
@@ -317,11 +317,23 @@ If you use jenkins, bamboo or any other build system, make sure
 one redis is installed somewhere and all runners can access to it.
 
 Create as many processes, nodes, dockers, kubernetes pods as you wish,
-but for each of the runners that you create, make sure each of them can connect 
+but for each of the runners that you create, make sure each of them can connect
 to the redis instance (e.g are in the same network).
 
 You can use the project name and build ID or job id as the execution ID for
 mocha-distributed. Use something unique among the builds of all your projects.
+
+## Testing mocha-distributed itself
+
+Run the following commands:
+
+```
+$ docker compose up -d
+$ ./test-example-nworkers.sh 3
+```
+
+Validate that tmp-output-*.log have executed properly. Pay special attention to
+serial behaviour on the different files/workers and tests with duplicate keys.
 
 ## MIT License
 

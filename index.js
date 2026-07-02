@@ -6,6 +6,8 @@
 const redis = require("redis");
 const crypto = require("crypto");
 
+const SERIAL_PREFIX = "[serial";
+
 const GRANULARITY = {
   TEST: "test",
   SUITE: "suite",
@@ -81,7 +83,7 @@ function getTestPath(testContext) {
 function getSerialGranularity(testKey) {
   // NOTE: a regular expression might be trickier to get right, since you can
   //       have multiple instances of [serialxxxx] on the same string
-  let index = testKey.indexOf('[serial')
+  let index = testKey.indexOf(SERIAL_PREFIX)
   if (index === -1)
     return testKey
 
@@ -182,7 +184,7 @@ exports.mochaHooks = {
     // string) so that the whole group is owned by a single runner. Adding a
     // ":dup-N" suffix would give each serial test a unique key again, breaking
     // serialization, so we must skip the duplicate handling for them.
-    const isSerial = testPath.join(":").indexOf("[serial") !== -1;
+    const isSerial = testPath.join(":").indexOf(SERIAL_PREFIX) !== -1;
 
     if (!isSerial) {
       // if this is the first attempt, we need to put a suffix to be able to

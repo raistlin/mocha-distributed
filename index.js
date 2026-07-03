@@ -51,8 +51,21 @@ let g_claimRefreshInterval = null;
 // EVENT_TEST_RETRY instead and never stores the error on the test object.
 const g_retryErrors = new Map();
 
-// Map to keep track of the number of times a test key full path has been seen,
-// to add a suffix and parallelize duplicated test titles in multiple runners
+// Pre-walk map: Test -> TestKeyInfo. Populated once at mochaGlobalSetup from
+// mocha's root suite, before any test runs. Used by beforeEach/afterEach as
+// the single source of truth for test keys. Rationale:
+//   - Deterministic across runners (DFS in mocha's registration order, which
+//     is identical when all runners load the same test files).
+//   - Encodes serial-collapse and :dup-N suffixing once, so the initial run
+//     and drain-phase re-runs never disagree on which key a test claims.
+//   - Also carries serial-group membership so afterEach knows when to mark
+//     the group as done in the shared done_tests set (last-in-group only).
+//
+// TestKeyInfo = { key, isSerial, serialGroupId, isLastInSerialGroup }
+const g_testKeyInfo = new WeakMap();
+// Fallback dup counter for tests that were not present at pre-walk time
+// (e.g. tests dynamically added inside a before() hook — an unsupported
+// pattern, but we degrade gracefully instead of throwing).
 const g_duplicateTestKeyFullPathCount = new Map();
 let g_lastTestKeyFullPath = null;
 
@@ -79,6 +92,101 @@ function getTestPath(testContext) {
   }
 
   return path.reverse();
+}
+
+// -----------------------------------------------------------------------------
+// walkSuite
+//
+// DFS iterator over every Test in a Suite tree, yielding tests in mocha's
+// registration order (which matches execution order for a plain run). Used
+// by computeTestKeys and by drain-phase filtering.
+// -----------------------------------------------------------------------------
+function walkSuite(suite, visit) {
+  if (!suite) return;
+  for (const test of suite.tests || []) visit(test);
+  for (const child of suite.suites || []) walkSuite(child, visit);
+}
+
+// -----------------------------------------------------------------------------
+// buildTestKeyFromPath
+//
+// Given a test's title-path array (root -> leaf, excluding the root suite),
+// apply serial collapse and return the base test key (no dup suffix).
+// -----------------------------------------------------------------------------
+function buildTestKeyFromPath(pathArr) {
+  const joined = pathArr.join(":");
+  const collapsed = getSerialGranularity(joined);
+  return `${g_testExecutionId}:${collapsed}`;
+}
+
+// -----------------------------------------------------------------------------
+// getTestPathFromTest
+//
+// Reconstructs the title path for a Test object by walking its .parent chain.
+// Equivalent to getTestPath(ctxt) but works on a raw Test rather than the
+// hook's `this.currentTest` context (they are the same object in practice,
+// but making the intent explicit here).
+// -----------------------------------------------------------------------------
+function getTestPathFromTest(test) {
+  const path = [test.title];
+  let p = test.parent;
+  while (p && !p.root) {
+    path.push(p.title);
+    p = p.parent;
+  }
+  return path.reverse();
+}
+
+// -----------------------------------------------------------------------------
+// computeTestKeys
+//
+// Walks the root suite once and assigns every Test its canonical key info.
+// Rules (must match the historical behavior of beforeEach):
+//   - Serial tests (`[serial...]` anywhere in the joined path) collapse to a
+//     shared key derived from the serial substring; no dup suffix.
+//   - Non-serial tests get a `:dup-N` suffix based on how many times their
+//     base key has been seen so far in the walk (N starts at 1).
+//   - Walk order is DFS in registration order, which is deterministic across
+//     runners loading the same test files. This is what makes independent
+//     runners agree on a test's key without any coordination.
+//
+// Also records serial-group membership so afterEach can tell when the last
+// test in a group finished (used later to mark the group done in redis).
+// -----------------------------------------------------------------------------
+function computeTestKeys(rootSuite) {
+  const dupCount = new Map();               // base key -> count seen so far
+  const serialGroupMembers = new Map();     // serial key -> [Test, ...]
+
+  walkSuite(rootSuite, (test) => {
+    const path = getTestPathFromTest(test);
+    const joined = path.join(":");
+    const isSerial = joined.indexOf(SERIAL_PREFIX) !== -1;
+    let key = buildTestKeyFromPath(path);
+
+    if (!isSerial) {
+      const n = (dupCount.get(key) || 0) + 1;
+      dupCount.set(key, n);
+      key = `${key}:dup-${n}`;
+    } else {
+      if (!serialGroupMembers.has(key)) serialGroupMembers.set(key, []);
+      serialGroupMembers.get(key).push(test);
+    }
+
+    g_testKeyInfo.set(test, {
+      key,
+      isSerial,
+      serialGroupId: isSerial ? key : null,
+      isLastInSerialGroup: false,
+    });
+  });
+
+  // Mark the last test in each serial group. Used by afterEach to decide when
+  // the whole group is done (see drain-phase design in
+  // docs/preemption-resilience-plan.md).
+  for (const members of serialGroupMembers.values()) {
+    const info = g_testKeyInfo.get(members[members.length - 1]);
+    if (info) info.isLastInSerialGroup = true;
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -167,6 +275,15 @@ exports.mochaGlobalSetup = async function () {
     process.exit(-1);
   });
   await g_redis.connect();
+
+  // Build the deterministic test-key map from mocha's root suite. `this` is
+  // the mocha Runner in the globalSetup context (verified with a quick probe;
+  // see the docs plan). Doing this here — before any test runs — lets
+  // beforeEach look up keys instead of re-deriving them, and prepares the
+  // ground for the drain phase which needs to reference tests by key.
+  if (this && this.suite) {
+    computeTestKeys(this.suite);
+  }
 };
 
 // -----------------------------------------------------------------------------
@@ -186,32 +303,50 @@ exports.mochaGlobalTeardown = async function () {
 // -----------------------------------------------------------------------------
 exports.mochaHooks = {
   beforeEach: async function () {
-    const testPath = getTestPath(this.currentTest);
-    let testKeyFullPath = `${g_testExecutionId}:${getSerialGranularity(testPath.join(":"))}`;
-    const testKeySuite = `${g_testExecutionId}:${getSerialGranularity(testPath[0])}`;
+    // Prefer the pre-walk key when present; fall back to the historical
+    // inline derivation for tests that weren't in the suite at globalSetup
+    // time (dynamically added tests — unsupported, but degrade gracefully).
+    const preInfo = g_testKeyInfo.get(this.currentTest);
 
-    // Serial tests intentionally collapse to a shared key (the "[serial...]"
-    // string) so that the whole group is owned by a single runner. Adding a
-    // ":dup-N" suffix would give each serial test a unique key again, breaking
-    // serialization, so we must skip the duplicate handling for them.
-    const isSerial = testPath.join(":").indexOf(SERIAL_PREFIX) !== -1;
+    let testKeyFullPath;
+    let testKeySuite;
+    let isSerial;
 
-    if (!isSerial) {
-      // if this is the first attempt, we need to put a suffix to be able to
-      // parallelize duplicates in multiple runners
-      if ((this.currentTest._currentRetry || 0) === 0) {
-        g_duplicateTestKeyFullPathCount.set(
-          testKeyFullPath,
-          (g_duplicateTestKeyFullPathCount.get(testKeyFullPath) || 0) + 1
-        );
-        testKeyFullPath += `:dup-${g_duplicateTestKeyFullPathCount.get(testKeyFullPath)}`;
-        g_lastTestKeyFullPath = testKeyFullPath;
-      }
-      else {
-        // ensure we use the same key for retries as the original attempt, otherwise
-        // we will screw up the distribution of tests; we use the last generated key
-        // since retries are executed sequentially
-        testKeyFullPath = g_lastTestKeyFullPath;
+    if (preInfo) {
+      testKeyFullPath = preInfo.key;
+      isSerial = preInfo.isSerial;
+      // Suite-granularity key still derives from the first path segment,
+      // as it did historically. Compute it from the live path.
+      const livePath = getTestPath(this.currentTest);
+      testKeySuite = `${g_testExecutionId}:${getSerialGranularity(livePath[0])}`;
+      // Keep the legacy retry-fallback in sync: mocha clones a Test for
+      // each retry (Runnable.retriedTest), and the clone is not in
+      // g_testKeyInfo. When the retry fires, preInfo is missing and the
+      // fallback below reads g_lastTestKeyFullPath — it must reflect the
+      // key we assigned to the original attempt of this same test.
+      g_lastTestKeyFullPath = testKeyFullPath;
+    } else {
+      const testPath = getTestPath(this.currentTest);
+      // Reuse the same base-key builder the pre-walk uses (buildTestKeyFromPath)
+      // instead of re-deriving the join+serial-collapse expression here, so
+      // the two paths can't silently diverge on how a key is built.
+      testKeyFullPath = buildTestKeyFromPath(testPath);
+      testKeySuite = `${g_testExecutionId}:${getSerialGranularity(testPath[0])}`;
+      isSerial = testPath.join(":").indexOf(SERIAL_PREFIX) !== -1;
+
+      if (!isSerial) {
+        // Legacy dup-suffix path for tests missing from the pre-walk. Kept
+        // as a compatibility shim; the pre-walk is the intended source.
+        if ((this.currentTest._currentRetry || 0) === 0) {
+          g_duplicateTestKeyFullPathCount.set(
+            testKeyFullPath,
+            (g_duplicateTestKeyFullPathCount.get(testKeyFullPath) || 0) + 1
+          );
+          testKeyFullPath += `:dup-${g_duplicateTestKeyFullPathCount.get(testKeyFullPath)}`;
+          g_lastTestKeyFullPath = testKeyFullPath;
+        } else {
+          testKeyFullPath = g_lastTestKeyFullPath;
+        }
       }
     }
 

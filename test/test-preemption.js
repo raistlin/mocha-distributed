@@ -393,4 +393,70 @@ describe('mocha-distributed preemption resilience', function () {
       assert.ok(del, 'SIGTERM handler DELd the in-flight claim key');
     });
   });
+
+  // ---------------------------------------------------------------------------
+  describe('pre-walk key stability (dup-N + serial collapse)', function () {
+    // The pre-walk assigns each test its canonical key (with :dup-N suffix
+    // for duplicated titles, and a collapsed [serial-x] key for serial
+    // tests) before any test runs. This test asserts that the SET NX calls
+    // observed by redis match the deterministic keys produced by the walk.
+    let client, lib;
+
+    before(function () {
+      client = makeMockClient();
+      injectMockRedis(client);
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-keys';
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-keys';
+      delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
+      delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
+      lib = loadFreshLib();
+    });
+
+    after(function () { restoreRedis(); clearLib(); });
+
+    it('assigns :dup-N suffixes and collapses serial keys as expected', async function () {
+      this.timeout(10000);
+
+      const m = new Mocha({ reporter: 'min' });
+      m.rootHooks(lib.mochaHooks);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+
+      // Two duplicated titles + a serial group of three tests.
+      const suite = Suite.create(m.suite, 'keys-suite');
+      suite.addTest(new Test('dup-title', function () {}));
+      suite.addTest(new Test('dup-title', function () {}));
+      suite.addTest(new Test('dup-title', function () {}));
+      suite.addTest(new Test('serial-1 [serial-group-a]', function () {}));
+      suite.addTest(new Test('serial-2 [serial-group-a]', function () {}));
+      suite.addTest(new Test('serial-3 [serial-group-a]', function () {}));
+
+      await new Promise(resolve => m.run(resolve));
+
+      // Collect the keys used in every SET NX call in order.
+      const setKeys = client.calls
+        .filter(c => c[0] === 'multi')
+        .map(c => c[1].find(cmd => cmd[0] === 'set'))
+        .filter(Boolean)
+        .map(cmd => cmd[1]);
+
+      const execId = 'pre-exec-keys';
+      // Duplicated titles must get consecutive :dup-N suffixes on the same
+      // base key. Order matches suite registration order (DFS in the walk).
+      assert.deepStrictEqual(setKeys.slice(0, 3), [
+        `${execId}:keys-suite:dup-title:dup-1`,
+        `${execId}:keys-suite:dup-title:dup-2`,
+        `${execId}:keys-suite:dup-title:dup-3`,
+      ], 'duplicated titles get stable :dup-N suffixes from the pre-walk');
+
+      // All three serial tests must collapse to the same claim key derived
+      // from the [serial-group-a] substring — no dup suffix, no per-test
+      // uniqueness. This is what makes the whole group run on one runner.
+      const serialKey = `${execId}:[serial-group-a]`;
+      assert.deepStrictEqual(setKeys.slice(3, 6),
+        [serialKey, serialKey, serialKey],
+        'serial-group tests share one collapsed claim key');
+    });
+  });
 });

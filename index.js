@@ -5,6 +5,7 @@
 // -----------------------------------------------------------------------------
 const redis = require("redis");
 const crypto = require("crypto");
+const Mocha = require("mocha");
 
 const SERIAL_PREFIX = "[serial";
 
@@ -74,6 +75,32 @@ let g_runnersActiveDecremented = false;
 // expected_total in redis via max-tracking, and later as a fast local
 // check during drain.
 let g_localExpectedCount = 0;
+
+// Reference to the root Suite captured at globalSetup. The drain phase
+// reuses it to build fresh Mocha.Runner instances that re-execute only
+// the orphaned tests (marked non-pending; everything else stays pending).
+let g_rootSuite = null;
+// Snapshot of each test's original `pending` flag, captured once, so drain
+// iterations can restore state between attempts without accidentally
+// unhiding user-authored `it.skip(...)` tests.
+let g_originalPending = new WeakMap();
+// True while the drain loop is active. Read by beforeEach so it can apply
+// drain-specific bookkeeping (rescue budget etc., added in a later step).
+let g_drainPhase = false;
+// How many tests this runner personally rescued during drain. Reported in
+// the completion banner — useful for post-hoc analysis of which pods did
+// the rescuing work.
+let g_localRescueCount = 0;
+
+// Drain configuration. All have documented defaults; see docs plan.
+const g_drainEnabled =
+  (process.env.MOCHA_DISTRIBUTED_DRAIN_ENABLED || "true") !== "false";
+const g_drainTimeoutSec =
+  parseInt(process.env.MOCHA_DISTRIBUTED_DRAIN_TIMEOUT || "1800", 10) || 1800;
+const g_drainPollIntervalSec = Math.max(
+  1,
+  parseInt(process.env.MOCHA_DISTRIBUTED_DRAIN_POLL_INTERVAL || "5", 10) || 5
+);
 
 // Cache errors from intermediate retry attempts. Mocha only sets test.err via
 // the reporter on the final EVENT_TEST_FAIL; for non-final retries it emits
@@ -319,6 +346,225 @@ async function decrementRunnersActive() {
 }
 
 // -----------------------------------------------------------------------------
+// sleep
+//
+// Await-friendly sleep used by the drain-phase poll loop.
+// -----------------------------------------------------------------------------
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// -----------------------------------------------------------------------------
+// computeOrphans
+//
+// Return the set of test keys that are unaccounted for: present in
+// test_universe, absent from done_tests, and with no live claim key. Fewer
+// round-trips than the naive per-key polling; two pipelined multis in the
+// worst case:
+//   1. SDIFF test_universe done_tests — candidate orphans.
+//   2. EXISTS candidate_i (batched) — filter out live in-flight claims.
+//
+// Returns an Array<string> so callers can iterate deterministically for
+// logging.
+// -----------------------------------------------------------------------------
+async function computeOrphans() {
+  const universeKey = redisKeys.testUniverse();
+  const doneKey     = redisKeys.doneTests();
+
+  let candidates = [];
+  try {
+    // node-redis v4 exposes sDiff / sMembers; fall back gracefully if the
+    // client stub in tests doesn't implement it.
+    if (typeof g_redis.sDiff === "function") {
+      candidates = await g_redis.sDiff([universeKey, doneKey]);
+    } else {
+      const [uni, done] = await Promise.all([
+        g_redis.sMembers(universeKey),
+        g_redis.sMembers(doneKey),
+      ]);
+      const doneSet = new Set(done || []);
+      candidates = (uni || []).filter((k) => !doneSet.has(k));
+    }
+  } catch (_) {
+    return [];
+  }
+
+  if (!candidates || candidates.length === 0) return [];
+
+  // Pipelined EXISTS: filter out any candidate whose claim key is still
+  // present in redis. A present claim means either an in-flight test
+  // (short TTL, someone else is running it) or a completed tombstone
+  // (long TTL) — both mean we shouldn't try to rescue it right now.
+  try {
+    const multi = g_redis.multi();
+    for (const k of candidates) multi.exists(k);
+    const results = await multi.exec();
+    const orphans = [];
+    for (let i = 0; i < candidates.length; i++) {
+      if (!results[i]) orphans.push(candidates[i]);
+    }
+    return orphans;
+  } catch (_) {
+    // If EXISTS fails, be conservative and return no orphans rather than
+    // trigger a re-run against stale state.
+    return [];
+  }
+}
+
+// -----------------------------------------------------------------------------
+// getDoneCount
+//
+// Cheap early-exit check for the drain loop: SCARD done_tests. Compared
+// against expected_total to know when the execution is globally complete.
+// -----------------------------------------------------------------------------
+async function getDoneCount() {
+  const key = redisKeys.doneTests();
+  try { return await g_redis.sCard(key); }
+  catch (_) { return 0; }
+}
+
+async function getExpectedTotal() {
+  const key = redisKeys.expectedTotal();
+  try {
+    const v = await g_redis.get(key);
+    return parseInt(v || "0", 10) || 0;
+  } catch (_) { return 0; }
+}
+
+async function getRunnersActive() {
+  const key = redisKeys.runnersActive();
+  try {
+    const v = await g_redis.get(key);
+    return parseInt(v || "0", 10) || 0;
+  } catch (_) { return 0; }
+}
+
+// -----------------------------------------------------------------------------
+// runDrainIteration
+//
+// Re-execute the given orphan keys by walking the shared root Suite,
+// marking non-orphans as pending, and driving a fresh Mocha.Runner over
+// the tree. Uses public mocha API (Suite + Runner) to avoid reaching into
+// internals; the reason we keep the root Suite alive across iterations is
+// that Mocha's Runner is single-use once it has emitted its terminal
+// EVENT_RUN_END, but the Suite tree itself is safely reusable.
+//
+// The claim/skip machinery in beforeEach continues to work naturally:
+// several drain-phase runners may race on the same orphan, but SET NX
+// serialises them.
+// -----------------------------------------------------------------------------
+async function runDrainIteration(orphanKeys) {
+  if (!g_rootSuite) return;
+  const orphanSet = new Set(orphanKeys);
+
+  // Restore the original pending state, then mark non-orphans as pending.
+  // Tests originally authored as `it.skip(...)` stay skipped no matter what.
+  walkSuite(g_rootSuite, (test) => {
+    const info = g_testKeyInfo.get(test);
+    const originallyPending = g_originalPending.get(test);
+    if (originallyPending) {
+      test.pending = true;
+      return;
+    }
+    // Skip tests whose canonical key is not among the current orphans.
+    // Mocha short-circuits `pending` tests before hooks fire, so beforeEach
+    // won't issue any redis ops for these — zero waste per drain iteration.
+    test.pending = !(info && orphanSet.has(info.key));
+  });
+
+  try {
+    const RunnerCtor = Mocha.Runner;
+    const runner = new RunnerCtor(g_rootSuite, { delay: false });
+    // Silence any default reporter noise: don't wire one up. The lib's
+    // own drain-phase logging (added in a later step) handles user output.
+    await new Promise((resolve) => runner.run(resolve));
+  } catch (err) {
+    console.log(`[mocha-distributed] drain: iteration errored: ${err && err.message}`);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// drainPhaseBanner
+//
+// One-shot header printed when drain begins. Deliberately in a fixed shape
+// so it's easy to grep in kubectl-logs output.
+// -----------------------------------------------------------------------------
+async function drainPhaseBanner() {
+  const expected = await getExpectedTotal();
+  const done = await getDoneCount();
+  const waiting = Math.max(0, expected - done);
+  console.log(`[mocha-distributed] Local test iteration complete. Entering drain phase.`);
+  console.log(`[mocha-distributed]   Local tests attempted : ${g_localExpectedCount}`);
+  console.log(`[mocha-distributed]   Global tests expected : ${expected}`);
+  console.log(`[mocha-distributed]   Global tests done     : ${done}`);
+  console.log(`[mocha-distributed]   Waiting for           : ${waiting} tests`);
+  console.log(`[mocha-distributed]   Drain timeout         : ${g_drainTimeoutSec}s`);
+}
+
+// -----------------------------------------------------------------------------
+// runDrainLoop
+//
+// The heart of Phase B. Every runner enters this after its local mocha
+// iteration finishes. Loop invariants:
+//   - Exit as soon as SCARD done_tests >= expected_total.
+//   - Exit non-zero (via caller) if wall-clock reaches drain timeout.
+//   - On every iteration: compute orphans, rescue any we find, otherwise
+//     sleep (with jitter) and re-check.
+//
+// The loop does not attempt to be clever about which runner rescues which
+// orphan — the claim/skip mechanism in beforeEach serialises races.
+// -----------------------------------------------------------------------------
+async function runDrainLoop() {
+  g_drainPhase = true;
+  const startedAt = Date.now();
+  const timeoutMs = g_drainTimeoutSec * 1000;
+
+  await drainPhaseBanner();
+
+  while (true) {
+    // Timeout check
+    const elapsedMs = Date.now() - startedAt;
+    if (elapsedMs >= timeoutMs) {
+      const done = await getDoneCount();
+      const expected = await getExpectedTotal();
+      console.log(
+        `[mocha-distributed] drain: TIMEOUT after ${g_drainTimeoutSec}s — ` +
+        `${done}/${expected} tests done, ` +
+        `${Math.max(0, expected - done)} still unaccounted for`
+      );
+      return { timedOut: true, done, expected };
+    }
+
+    // Cheap early-exit: done count reached expected total?
+    const done = await getDoneCount();
+    const expected = await getExpectedTotal();
+    if (expected > 0 && done >= expected) {
+      const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+      console.log(
+        `[mocha-distributed] drain: complete — ${done}/${expected} tests done, ` +
+        `elapsed ${elapsedSec}s, this runner rescued ${g_localRescueCount} tests`
+      );
+      return { timedOut: false, done, expected };
+    }
+
+    // Find orphans; run them if any; otherwise sleep and re-check.
+    const orphans = await computeOrphans();
+    if (orphans.length > 0) {
+      console.log(
+        `[mocha-distributed] drain: found ${orphans.length} orphan(s), attempting rescue`
+      );
+      await runDrainIteration(orphans);
+      // No sleep on a productive iteration; loop back immediately.
+    } else {
+      // Jittered sleep: base ± 20% to avoid thundering-herd polling.
+      const base = g_drainPollIntervalSec * 1000;
+      const jitter = Math.floor(base * 0.2 * (Math.random() * 2 - 1));
+      await sleep(base + jitter);
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
 // getSerialGranularity
 //
 // Returns the full string or the "serial string" which is whatever finds that
@@ -411,7 +657,13 @@ exports.mochaGlobalSetup = async function () {
   // beforeEach look up keys instead of re-deriving them, and prepares the
   // ground for the drain phase which needs to reference tests by key.
   if (this && this.suite) {
+    g_rootSuite = this.suite;
     computeTestKeys(this.suite);
+    // Snapshot original pending state so drain iterations can restore
+    // user-authored `it.skip(...)` between orphan-filter passes.
+    walkSuite(g_rootSuite, (test) => {
+      g_originalPending.set(test, !!test.pending);
+    });
   }
 
   // Publish shared state used by the drain phase:
@@ -431,6 +683,23 @@ exports.mochaGlobalSetup = async function () {
 // -----------------------------------------------------------------------------
 exports.mochaGlobalTeardown = async function () {
   if (g_redis) {
+    // Drain phase: block redis quit until the execution is globally
+    // accounted for, or until the drain timeout hits. See docs plan for
+    // rationale. Users can disable this with MOCHA_DISTRIBUTED_DRAIN_ENABLED
+    // if they need the old "exit as soon as local iteration finishes"
+    // behaviour — they should not, on preemptible infra.
+    if (g_drainEnabled) {
+      try { await runDrainLoop(); } catch (err) {
+        console.log(`[mocha-distributed] drain: aborted due to error: ${err && err.message}`);
+      }
+    } else {
+      console.log(
+        `[mocha-distributed] WARN: MOCHA_DISTRIBUTED_DRAIN_ENABLED=false — ` +
+        `preemption resilience degraded. Runners may exit while others are ` +
+        `still executing tests, orphaning any tests preempted afterward.`
+      );
+    }
+
     // Best-effort DECR before we tear down the connection. Idempotent, so
     // if SIGTERM fired first this is a no-op.
     try { await decrementRunnersActive(); } catch (_) {}

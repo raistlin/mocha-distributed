@@ -94,6 +94,9 @@ describe('mocha-distributed', function () {
       process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
       process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'test-exec-retry';
       process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-test';
+      // This suite does not exercise drain — keep the old "exit after
+      // local iteration" behaviour so teardown returns promptly.
+      process.env.MOCHA_DISTRIBUTED_DRAIN_ENABLED = 'false';
 
       lib = loadFreshLib();
     });

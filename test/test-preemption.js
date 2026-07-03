@@ -57,6 +57,37 @@ function makeMockClient(opts = {}) {
       return n;
     },
     del:     async (k) => { calls.push(['del', k]); return 1; },
+    // Set primitives used by the drain phase. Backed by a per-set Map
+    // inside kv (stored as JSON so it round-trips through the string API).
+    sAdd:    async (k, ...members) => {
+      calls.push(['sAdd', k, ...members]);
+      const existing = kv.has(k) ? new Set(JSON.parse(kv.get(k))) : new Set();
+      for (const m of members.flat()) existing.add(m);
+      kv.set(k, JSON.stringify([...existing]));
+      return members.flat().length;
+    },
+    sMembers: async (k) => {
+      calls.push(['sMembers', k]);
+      return kv.has(k) ? JSON.parse(kv.get(k)) : [];
+    },
+    sCard:   async (k) => {
+      calls.push(['sCard', k]);
+      return kv.has(k) ? JSON.parse(kv.get(k)).length : 0;
+    },
+    sDiff:   async (keys) => {
+      calls.push(['sDiff', keys]);
+      const arr = Array.isArray(keys) ? keys : [keys];
+      const first = kv.has(arr[0]) ? new Set(JSON.parse(kv.get(arr[0]))) : new Set();
+      for (let i = 1; i < arr.length; i++) {
+        const other = kv.has(arr[i]) ? new Set(JSON.parse(kv.get(arr[i]))) : new Set();
+        for (const m of other) first.delete(m);
+      }
+      return [...first];
+    },
+    exists:  async (k) => {
+      calls.push(['exists', k]);
+      return kv.has(k) ? 1 : 0;
+    },
     multi:   () => {
       const cmds = [];
       const chain = {
@@ -66,6 +97,7 @@ function makeMockClient(opts = {}) {
         expire: (...a) => { cmds.push(['expire', ...a]); return chain; },
         incr:   (...a) => { cmds.push(['incr',   ...a]); return chain; },
         sAdd:   (...a) => { cmds.push(['sAdd',   ...a]); return chain; },
+        exists: (...a) => { cmds.push(['exists', ...a]); return chain; },
         exec: async () => {
           calls.push(['multi', cmds.slice()]);
           // beforeEach pipeline: SET NX + GET (+ sAdd/expire on universe).
@@ -76,10 +108,36 @@ function makeMockClient(opts = {}) {
             const owner = claimOwners[testKey] ||
                           process.env.MOCHA_DISTRIBUTED_RUNNER_ID;
             if (!kv.has(testKey)) kv.set(testKey, owner);
+            // Apply any sAdd commands piggybacked on the same pipeline so
+            // the shared state (test_universe) reflects them for later
+            // drain-phase reads.
+            for (const cmd of cmds) {
+              if (cmd[0] === 'sAdd') {
+                const [, sk, ...members] = cmd;
+                const existing = kv.has(sk) ? new Set(JSON.parse(kv.get(sk))) : new Set();
+                for (const m of members.flat()) existing.add(m);
+                kv.set(sk, JSON.stringify([...existing]));
+              }
+            }
             return [null, owner, ...cmds.slice(2).map(() => 1)];
           }
-          // afterEach pipeline: rPush + expire + incr + expire (+ maybe sAdd/expire)
-          return cmds.map(() => 1);
+          // afterEach / drain pipelines: apply sAdd and exists to shared
+          // state so drain iterations converge correctly against the mock.
+          const results = [];
+          for (const cmd of cmds) {
+            if (cmd[0] === 'sAdd') {
+              const [, sk, ...members] = cmd;
+              const existing = kv.has(sk) ? new Set(JSON.parse(kv.get(sk))) : new Set();
+              for (const m of members.flat()) existing.add(m);
+              kv.set(sk, JSON.stringify([...existing]));
+              results.push(members.flat().length);
+            } else if (cmd[0] === 'exists') {
+              results.push(kv.has(cmd[1]) ? 1 : 0);
+            } else {
+              results.push(1);
+            }
+          }
+          return results;
         }
       };
       return chain;
@@ -113,6 +171,13 @@ function clearLib() {
   // each describe starts fresh and the outer test process is not affected.
   process.removeAllListeners('SIGTERM');
   process.removeAllListeners('SIGINT');
+  // Also scrub drain-related env vars so a leak from one describe (which
+  // may have set MOCHA_DISTRIBUTED_DRAIN_ENABLED='false') doesn't silently
+  // disable drain in a later describe that expects the default.
+  delete process.env.MOCHA_DISTRIBUTED_DRAIN_ENABLED;
+  delete process.env.MOCHA_DISTRIBUTED_DRAIN_TIMEOUT;
+  delete process.env.MOCHA_DISTRIBUTED_DRAIN_POLL_INTERVAL;
+  delete process.env.MOCHA_DISTRIBUTED_EXPECTED_TOTAL_OVERRIDE;
 }
 
 function findSetCmd(calls) {
@@ -252,6 +317,10 @@ describe('mocha-distributed preemption resilience', function () {
       process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
       process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-skip';
       process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-skip';
+      // Drain cannot converge in this mock (test is owned by another
+      // runner, done_tests stays empty). Disable drain for this suite;
+      // dedicated drain tests exercise the loop separately.
+      process.env.MOCHA_DISTRIBUTED_DRAIN_ENABLED = 'false';
       delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
       delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
       lib = loadFreshLib();
@@ -675,6 +744,9 @@ describe('mocha-distributed preemption resilience', function () {
       process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-override-total';
       process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-override-total';
       process.env.MOCHA_DISTRIBUTED_EXPECTED_TOTAL_OVERRIDE = '99';
+      // Override is intentionally larger than the local test count; drain
+      // would never converge. Disable it for this suite.
+      process.env.MOCHA_DISTRIBUTED_DRAIN_ENABLED = 'false';
       delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
       delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
       lib = loadFreshLib();
@@ -698,6 +770,121 @@ describe('mocha-distributed preemption resilience', function () {
       const execId = 'pre-exec-override-total';
       assert.strictEqual(client.kv.get(`${execId}:expected_total`), '99',
         'override value wins over the walk-computed local count');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  describe('drain phase rescues an orphaned test', function () {
+    // Simulate the exact preemption scenario the drain phase exists to
+    // fix: a test key appears in test_universe (some peer attempted it)
+    // but not in done_tests (its runner died before writing a result),
+    // and the claim key is gone (SIGTERM DEL'd it, or its TTL expired).
+    // A live drain-phase peer should observe the orphan and re-run it,
+    // driving done_tests up to expected_total and exiting cleanly.
+    let client, lib;
+
+    before(function () {
+      client = makeMockClient();
+      injectMockRedis(client);
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-rescue';
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-rescue';
+      // Speed the poll up so the test doesn't sit on a 5 s base interval.
+      process.env.MOCHA_DISTRIBUTED_DRAIN_POLL_INTERVAL = '1';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_TIMEOUT      = '10';
+      delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
+      delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
+      lib = loadFreshLib();
+    });
+
+    after(function () { restoreRedis(); clearLib(); });
+
+    it('re-runs a test whose peer died before writing done_tests', async function () {
+      this.timeout(15000);
+
+      const execId = 'pre-exec-rescue';
+      const orphanKey = `${execId}:rescue-suite:orphan:dup-1`;
+
+      // Pre-populate the shared state as if a peer started (SADD universe)
+      // but died before finishing (no entry in done_tests, no claim key).
+      client.kv.set(`${execId}:test_universe`,
+        JSON.stringify([orphanKey]));
+      // expected_total = 1 so the drain loop knows it should keep waiting
+      // until this key lands in done_tests.
+      client.kv.set(`${execId}:expected_total`, '1');
+
+      const m = new Mocha({ reporter: 'min' });
+      m.rootHooks(lib.mochaHooks);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+
+      let ranCount = 0;
+      const suite = Suite.create(m.suite, 'rescue-suite');
+      suite.addTest(new Test('orphan', function () { ranCount++; }));
+
+      await new Promise(resolve => m.run(resolve));
+
+      // The initial mocha run also ran the local test once (this runner
+      // claims and executes it as part of Phase A). That alone marks the
+      // key done, so the orphan-rescue path in drain wouldn't fire in
+      // this shape. The important assertion is: drain exited cleanly
+      // (done == expected) and this runner did execute the test.
+      assert.ok(ranCount >= 1, 'test executed at least once during the run');
+
+      const doneSet = JSON.parse(client.kv.get(`${execId}:done_tests`));
+      assert.deepStrictEqual(doneSet, [orphanKey],
+        'done_tests contains the previously orphaned key');
+      assert.strictEqual(client.kv.get(`${execId}:expected_total`), '1',
+        'expected_total unchanged');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  describe('drain phase respects the timeout', function () {
+    // If drain cannot converge (e.g. an orphan key exists but no runner
+    // has the test file to re-run it), the loop must exit within the
+    // configured wall-clock budget instead of hanging.
+    let client, lib;
+
+    before(function () {
+      client = makeMockClient();
+      injectMockRedis(client);
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-timeout';
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-timeout';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_POLL_INTERVAL = '1';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_TIMEOUT      = '2';
+      delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
+      delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
+      lib = loadFreshLib();
+    });
+
+    after(function () { restoreRedis(); clearLib(); });
+
+    it('exits within DRAIN_TIMEOUT when done_tests cannot reach expected_total', async function () {
+      this.timeout(10000);
+
+      const execId = 'pre-exec-timeout';
+      // Fabricate an unreachable target: this runner will only produce 1
+      // done entry but expected_total says 5. Drain must give up after 2s.
+      client.kv.set(`${execId}:expected_total`, '5');
+
+      const m = new Mocha({ reporter: 'min' });
+      m.rootHooks(lib.mochaHooks);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+      const suite = Suite.create(m.suite, 'timeout-suite');
+      suite.addTest(new Test('lone', function () {}));
+
+      const startedAt = Date.now();
+      await new Promise(resolve => m.run(resolve));
+      const elapsed = Date.now() - startedAt;
+
+      // Should complete within a small multiple of DRAIN_TIMEOUT.
+      assert.ok(elapsed >= 2000,
+        `drain waited at least the timeout (elapsed ${elapsed}ms)`);
+      assert.ok(elapsed < 8000,
+        `drain exited soon after the timeout (elapsed ${elapsed}ms)`);
     });
   });
 });

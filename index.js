@@ -23,6 +23,23 @@ const g_expirationTime =
 // once the test completes. See README "Claim key lifecycle".
 const g_claimExpirationTime =
   process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME || `${10 * 60}`;
+// Both TTLs come in as strings (env vars) or already-numbers (defaults).
+// Parse once here so every redis call below passes a number and no call
+// site has to remember to parseInt() it — the seemingly-safe raw fallback
+// silently mangled some redis client encoder paths under load (see the
+// integration-run notes later in this file's history).
+const g_expirationTimeSec = parseInt(g_expirationTime, 10) || (7 * 24 * 3600);
+const g_claimExpirationTimeSec = parseInt(g_claimExpirationTime, 10) || (10 * 60);
+
+// Central schema for the fixed-name redis keys used for cross-runner
+// coordination state (as opposed to per-test claim keys, which are built
+// dynamically by buildTestKeyFromPath). Grown incrementally as new shared
+// keys are introduced, so every reader/writer of a given key agrees on its
+// exact name instead of re-typing the template literal at each call site.
+const redisKeys = {
+  testUniverse: () => `${g_testExecutionId}:test_universe`,
+  doneTests: () => `${g_testExecutionId}:done_tests`,
+};
 
 // Generate a unique random id for this runner (with almost 100% certainty
 // to be different on any machine/environment).
@@ -63,6 +80,14 @@ const g_retryErrors = new Map();
 //
 // TestKeyInfo = { key, isSerial, serialGroupId, isLastInSerialGroup }
 const g_testKeyInfo = new WeakMap();
+// Full set of distinct claim keys from this runner's local pre-walk.
+// Prepopulated into test_universe at mochaGlobalSetup (see
+// publishTestUniverse) so a test whose every attempt is preempted before
+// its beforeEach ever fires is still discoverable as an orphan during
+// drain -- SDIFF against done_tests only rescues keys that are IN
+// test_universe, and until now the only writer was the per-attempt SADD
+// in beforeEach.
+let g_localTestKeys = new Set();
 // Fallback dup counter for tests that were not present at pre-walk time
 // (e.g. tests dynamically added inside a before() hook — an unsupported
 // pattern, but we degrade gracefully instead of throwing).
@@ -138,6 +163,26 @@ function getTestPathFromTest(test) {
 }
 
 // -----------------------------------------------------------------------------
+// publishTestUniverse
+//
+// Prepopulate test_universe with every claim key this runner's local
+// pre-walk knows about, before any test executes. Additive to (never a
+// replacement for) the per-attempt SADD in beforeEach -- that SADD is the
+// only path for tests added dynamically inside a before() hook (an
+// unsupported-but-degraded-gracefully pattern), so it must stay. SADD is
+// idempotent, so re-adding an already-present key here is a no-op.
+// -----------------------------------------------------------------------------
+async function publishTestUniverse() {
+  if (g_localTestKeys.size === 0) return;
+  const key = redisKeys.testUniverse();
+  await g_redis
+    .multi()
+    .sAdd(key, Array.from(g_localTestKeys))
+    .expire(key, g_expirationTimeSec)
+    .exec();
+}
+
+// -----------------------------------------------------------------------------
 // computeTestKeys
 //
 // Walks the root suite once and assigns every Test its canonical key info.
@@ -157,6 +202,7 @@ function computeTestKeys(rootSuite) {
   const dupCount = new Map();               // base key -> count seen so far
   const serialGroupMembers = new Map();     // serial key -> [Test, ...]
 
+  g_localTestKeys.clear();
   walkSuite(rootSuite, (test) => {
     const path = getTestPathFromTest(test);
     const joined = path.join(":");
@@ -172,6 +218,7 @@ function computeTestKeys(rootSuite) {
       serialGroupMembers.get(key).push(test);
     }
 
+    g_localTestKeys.add(key);
     g_testKeyInfo.set(test, {
       key,
       isSerial,
@@ -284,6 +331,7 @@ exports.mochaGlobalSetup = async function () {
   if (this && this.suite) {
     computeTestKeys(this.suite);
   }
+  try { await publishTestUniverse(); } catch (_) {}
 };
 
 // -----------------------------------------------------------------------------
@@ -355,10 +403,19 @@ exports.mochaHooks = {
 
     // Atomically set/get the runner id associated to this test. Only the first
     // runner to get there will set the value to its own runner id.
+    //
+    // Piggyback the test_universe SADD onto the same pipeline: every attempt
+    // on any runner (whether it wins the claim or not) contributes a member
+    // to the shared set. The drain phase later diffs test_universe against
+    // done_tests to find orphans, so we want the set to reflect "tests that
+    // have been attempted somewhere", not just "tests this runner claimed".
+    const universeKey = redisKeys.testUniverse();
     const [_, assignedRunnerId] = await g_redis
       .multi()
       .set(testKey, g_runnerId, { EX: g_claimExpirationTime, NX: true })
       .get(testKey)
+      .sAdd(universeKey, testKey)
+      .expire(universeKey, g_expirationTimeSec)
       .exec();
 
     if (assignedRunnerId !== g_runnerId) {
@@ -455,13 +512,38 @@ exports.mochaHooks = {
       const resultKey = `${g_testExecutionId}:test_result`;
       const countKey = `${g_testExecutionId}:${stateFixed}_count`;
 
-      await g_redis
+      // Mark this test key as done in the shared set, so the drain phase
+      // can tell it has been accounted for. Serial groups share one claim
+      // key and are semantically "done" only when the last test in the
+      // group finishes; marking done earlier would let a drain-phase peer
+      // conclude the group is complete while later tests still have to run
+      // if the owner gets preempted mid-group.
+      const preInfoAE = g_testKeyInfo.get(this.currentTest);
+      let shouldMarkDone;
+      if (preInfoAE) {
+        shouldMarkDone = !preInfoAE.isSerial || preInfoAE.isLastInSerialGroup;
+      } else {
+        // Fallback for tests missing from the pre-walk: only mark non-serial
+        // tests. Under-marking is safer than over-marking here — a missing
+        // done entry causes an unnecessary rescue attempt (harmless, gated
+        // by SET NX), whereas a premature done entry could hide an orphan.
+        const livePath = getTestPath(this.currentTest).join(":");
+        shouldMarkDone = livePath.indexOf(SERIAL_PREFIX) === -1;
+      }
+      const doneKey = redisKeys.doneTests();
+
+      let pipe = g_redis
         .multi()
         .rPush(resultKey, JSON.stringify(testResult))
-        .expire(resultKey, g_expirationTime)
+        .expire(resultKey, g_expirationTimeSec)
         .incr(countKey)
-        .expire(countKey, g_expirationTime)
-        .exec();
+        .expire(countKey, g_expirationTimeSec);
+      if (shouldMarkDone && g_currentClaimKey) {
+        pipe = pipe
+          .sAdd(doneKey, g_currentClaimKey)
+          .expire(doneKey, g_expirationTimeSec);
+      }
+      await pipe.exec();
     }
 
     // Stop the keepalive and promote the claim key to a tombstone matching

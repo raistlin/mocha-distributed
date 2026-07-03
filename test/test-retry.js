@@ -30,13 +30,15 @@ const mockMulti = (writtenResults) => () => {
     },
     expire: (...a) => { cmds.push(['expire', ...a]); return chain; },
     incr:   (...a) => { cmds.push(['incr',   ...a]); return chain; },
+    sAdd:   (...a) => { cmds.push(['sAdd',   ...a]); return chain; },
     exec: async () => {
-      // beforeEach pipeline: SET NX + GET — this runner always wins ownership
+      // beforeEach pipeline: SET NX + GET (+ optional universe SADD/EXPIRE)
       if (cmds[0] && cmds[0][0] === 'set') {
-        return [null, process.env.MOCHA_DISTRIBUTED_RUNNER_ID];
+        return [null, process.env.MOCHA_DISTRIBUTED_RUNNER_ID,
+                ...cmds.slice(2).map(() => 1)];
       }
-      // afterEach pipeline: rPush + expire + incr + expire
-      return [1, 1, 1, 1];
+      // afterEach pipeline: rPush + expire + incr + expire (+ optional sAdd/expire)
+      return cmds.map(() => 1);
     }
   };
   return chain;

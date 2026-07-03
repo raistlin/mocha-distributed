@@ -44,16 +44,19 @@ function makeMockClient(opts = {}) {
         rPush:  (...a) => { cmds.push(['rPush',  ...a]); return chain; },
         expire: (...a) => { cmds.push(['expire', ...a]); return chain; },
         incr:   (...a) => { cmds.push(['incr',   ...a]); return chain; },
+        sAdd:   (...a) => { cmds.push(['sAdd',   ...a]); return chain; },
         exec: async () => {
           calls.push(['multi', cmds.slice()]);
-          // beforeEach pipeline: SET NX + GET
+          // beforeEach pipeline: SET NX + GET (+ sAdd/expire on universe)
           if (cmds[0] && cmds[0][0] === 'set') {
             const testKey = cmds[0][1];
             const owner = claimOwners[testKey] ||
                           process.env.MOCHA_DISTRIBUTED_RUNNER_ID;
-            return [null, owner];
+            // Return one result slot per command; only the second (GET)
+            // is read by the lib (destructured as [_, assignedRunnerId]).
+            return [null, owner, ...cmds.slice(2).map(() => 1)];
           }
-          // afterEach pipeline: rPush + expire + incr + expire
+          // afterEach pipeline: rPush + expire + incr + expire (+ maybe sAdd/expire)
           return cmds.map(() => 1);
         }
       };
@@ -210,9 +213,13 @@ describe('mocha-distributed preemption resilience', function () {
         const realExec = chain.exec;
         chain.exec = async function () {
           const result = await realExec();
-          // beforeEach pipeline: replace assignedRunnerId with foreign id
-          if (Array.isArray(result) && result.length === 2 && result[0] === null) {
-            return [null, 'other-runner'];
+          // beforeEach pipeline: replace assignedRunnerId with foreign id.
+          // Detect it by the shape: SET NX returns null and GET returns a
+          // string runner id, whereas afterEach returns only integers.
+          if (Array.isArray(result) && result[0] === null &&
+              typeof result[1] === 'string') {
+            result[1] = 'other-runner';
+            return result;
           }
           return result;
         };
@@ -457,6 +464,122 @@ describe('mocha-distributed preemption resilience', function () {
       assert.deepStrictEqual(setKeys.slice(3, 6),
         [serialKey, serialKey, serialKey],
         'serial-group tests share one collapsed claim key');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  describe('test_universe + done_tests bookkeeping', function () {
+    // The drain phase relies on two sets in redis:
+    //   test_universe : every test key that has been attempted anywhere.
+    //   done_tests    : every test key that has been fully accounted for.
+    // Serial groups collapse to one claim key; they should be marked done
+    // only when the last test in the group finishes, otherwise a drain-phase
+    // peer could conclude the group is complete mid-run.
+    let client, lib;
+
+    before(function () {
+      client = makeMockClient();
+      injectMockRedis(client);
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-sets';
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-sets';
+      delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
+      delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
+      lib = loadFreshLib();
+    });
+
+    after(function () { restoreRedis(); clearLib(); });
+
+    it('SADDs every attempt to test_universe and marks done_tests correctly', async function () {
+      this.timeout(10000);
+
+      const m = new Mocha({ reporter: 'min' });
+      m.rootHooks(lib.mochaHooks);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+
+      const suite = Suite.create(m.suite, 'sets-suite');
+      suite.addTest(new Test('plain', function () {}));
+      suite.addTest(new Test('s1 [serial-g]', function () {}));
+      suite.addTest(new Test('s2 [serial-g]', function () {}));
+      suite.addTest(new Test('s3 [serial-g]', function () {}));
+
+      await new Promise(resolve => m.run(resolve));
+
+      const execId = 'pre-exec-sets';
+      const universeKey = `${execId}:test_universe`;
+      const doneKey     = `${execId}:done_tests`;
+
+      // Collect all sAdd commands across every beforeEach/afterEach pipeline
+      // observed -- this excludes the separate prepopulation pipeline that
+      // globalSetup fires once, upfront (identifiable as a multi pipeline
+      // whose first command is itself 'sAdd', carrying the whole key set as
+      // a single array member rather than one key per attempt).
+      const sAdds = [];
+      for (const c of client.calls) {
+        if (c[0] !== 'multi' || (c[1][0] && c[1][0][0] === 'sAdd')) continue;
+        for (const cmd of c[1]) {
+          if (cmd[0] === 'sAdd') sAdds.push({ key: cmd[1], member: cmd[2] });
+        }
+      }
+
+      const universeAdds = sAdds.filter(x => x.key === universeKey).map(x => x.member);
+      const doneAdds     = sAdds.filter(x => x.key === doneKey    ).map(x => x.member);
+
+      // Every beforeEach contributes one universe member: 4 attempts (1 plain
+      // + 3 serial tests, though serial tests share one claim key, they still
+      // each hit beforeEach independently).
+      assert.strictEqual(universeAdds.length, 4,
+        'test_universe SADD fires once per beforeEach');
+
+      const plainKey  = `${execId}:sets-suite:plain:dup-1`;
+      const serialKey = `${execId}:[serial-g]`;
+
+      assert.deepStrictEqual(universeAdds.sort(),
+        [plainKey, serialKey, serialKey, serialKey].sort(),
+        'universe members match the expected claim keys');
+
+      // done_tests: one entry for the plain test, and one for the serial
+      // group (only from the last-in-group afterEach). Not three.
+      assert.deepStrictEqual(doneAdds.sort(),
+        [plainKey, serialKey].sort(),
+        'done_tests receives the plain key and one entry for the whole serial group');
+    });
+
+    it('prepopulates test_universe at globalSetup, before any beforeEach fires', async function () {
+      this.timeout(10000);
+
+      const m = new Mocha({ reporter: 'min' });
+      m.rootHooks(lib.mochaHooks);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+
+      const suite = Suite.create(m.suite, 'sets-suite');
+      suite.addTest(new Test('plain', function () {}));
+      suite.addTest(new Test('s1 [serial-g]', function () {}));
+      suite.addTest(new Test('s2 [serial-g]', function () {}));
+      suite.addTest(new Test('s3 [serial-g]', function () {}));
+
+      await new Promise(resolve => m.run(resolve));
+
+      const execId = 'pre-exec-sets';
+      const universeKey = `${execId}:test_universe`;
+      const plainKey  = `${execId}:sets-suite:plain:dup-1`;
+      const serialKey = `${execId}:[serial-g]`;
+
+      // The prepopulation SADD fires from globalSetup, before any test runs,
+      // so its multi() pipeline must be the very first one observed --
+      // distinguishable from a beforeEach claim pipeline (which always
+      // starts with 'set') by starting with 'sAdd' instead.
+      const firstMulti = client.calls.find(c => c[0] === 'multi');
+      assert.ok(firstMulti, 'at least one multi pipeline ran');
+      assert.strictEqual(firstMulti[1][0][0], 'sAdd',
+        'the first multi pipeline is the prepopulation SADD, not a beforeEach claim');
+
+      const [, sadKey, members] = firstMulti[1][0];
+      assert.strictEqual(sadKey, universeKey, 'prepopulation SADD targets test_universe');
+      assert.deepStrictEqual([...members].sort(), [plainKey, serialKey].sort(),
+        'prepopulation SADD carries every distinct claim key from the local pre-walk');
     });
   });
 });

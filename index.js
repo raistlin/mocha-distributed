@@ -39,6 +39,8 @@ const g_claimExpirationTimeSec = parseInt(g_claimExpirationTime, 10) || (10 * 60
 const redisKeys = {
   testUniverse: () => `${g_testExecutionId}:test_universe`,
   doneTests: () => `${g_testExecutionId}:done_tests`,
+  expectedTotal: () => `${g_testExecutionId}:expected_total`,
+  runnersActive: () => `${g_testExecutionId}:runners_active`,
 };
 
 // Generate a unique random id for this runner (with almost 100% certainty
@@ -62,6 +64,16 @@ let g_capture = { stdout: null, stderr: null };
 // after completion, and DEL it on SIGTERM.
 let g_currentClaimKey = null;
 let g_claimRefreshInterval = null;
+
+// runners_active bookkeeping. Every runner INCRs at globalSetup and DECRs
+// exactly once at teardown or on SIGTERM/SIGINT. The flag guards against
+// double-decrement when both paths could fire.
+let g_runnersActiveDecremented = false;
+
+// Local test count derived from computeTestKeys. Used to publish
+// expected_total in redis via max-tracking, and later as a fast local
+// check during drain.
+let g_localExpectedCount = 0;
 
 // Cache errors from intermediate retry attempts. Mocha only sets test.err via
 // the reporter on the final EVENT_TEST_FAIL; for non-final retries it emits
@@ -234,6 +246,76 @@ function computeTestKeys(rootSuite) {
     const info = g_testKeyInfo.get(members[members.length - 1]);
     if (info) info.isLastInSerialGroup = true;
   }
+
+  // Count distinct claim keys: serial groups collapse to one key regardless
+  // of member count, plain tests contribute one each (with :dup-N making
+  // duplicated titles distinct). This is what expected_total is compared
+  // against globally. g_localTestKeys (populated in the walk above) already
+  // holds exactly this set, so no second walk is needed to derive the count.
+  g_localExpectedCount = g_localTestKeys.size;
+}
+
+// -----------------------------------------------------------------------------
+// publishExpectedTotal
+//
+// Max-tracking publication of the globally expected test count. Every runner
+// computes its local count from computeTestKeys (which should agree across
+// runners loading the same test files), reads the current published value,
+// and writes its own if higher. A MOCHA_DISTRIBUTED_EXPECTED_TOTAL_OVERRIDE
+// env var takes precedence — escape hatch for suites with dynamically added
+// tests where the pre-walk under-counts.
+//
+// The GET / SET pair is not atomic; two runners racing may both write the
+// same or a lower value. Since all runners produce the same local count in
+// the well-configured case, this is a self-correcting no-op in practice.
+// Homogeneous-invocation divergence (Q6 in the plan) is reported as a WARN
+// on startup rather than enforced.
+// -----------------------------------------------------------------------------
+async function publishExpectedTotal() {
+  const override = process.env.MOCHA_DISTRIBUTED_EXPECTED_TOTAL_OVERRIDE;
+  const local = override != null && override !== ''
+    ? (parseInt(override, 10) || 0)
+    : g_localExpectedCount;
+
+  if (local <= 0) return;
+
+  const key = redisKeys.expectedTotal();
+  const raw = await g_redis.get(key);
+  const remote = parseInt(raw || '0', 10) || 0;
+
+  if (local > remote) {
+    await g_redis.set(key, String(local), { EX: g_expirationTimeSec });
+  } else if (local < remote) {
+    console.log(
+      `[mocha-distributed] WARN: this runner sees ${local} tests but ` +
+      `another runner published ${remote} — heterogeneous invocation ` +
+      `detected, drain may not converge. Ensure all runners use the same ` +
+      `test files and the same --grep / .only() configuration.`
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// incrementRunnersActive / decrementRunnersActive
+//
+// Track the number of live runners so drain-phase peers can distinguish
+// "still work in flight elsewhere" from "nobody left to rescue." Decrement is
+// idempotent: both the normal teardown path and the SIGTERM path may call it,
+// but the counter must only move once per runner.
+// -----------------------------------------------------------------------------
+async function incrementRunnersActive() {
+  const key = redisKeys.runnersActive();
+  await g_redis.incr(key);
+  await g_redis.expire(key, g_expirationTimeSec);
+}
+
+async function decrementRunnersActive() {
+  if (g_runnersActiveDecremented) return;
+  g_runnersActiveDecremented = true;
+  try {
+    const key = redisKeys.runnersActive();
+    await g_redis.decr(key);
+  } catch (_) { /* best-effort during shutdown */ }
 }
 
 // -----------------------------------------------------------------------------
@@ -331,7 +413,17 @@ exports.mochaGlobalSetup = async function () {
   if (this && this.suite) {
     computeTestKeys(this.suite);
   }
-  try { await publishTestUniverse(); } catch (_) {}
+
+  // Publish shared state used by the drain phase:
+  //   - test_universe  : full local key set, published upfront so a test
+  //                       whose every attempt is preempted before its
+  //                       beforeEach fires is still discoverable as an orphan.
+  //   - expected_total : max across runners of local test count.
+  //   - runners_active : live runner counter, INCR here / DECR at teardown.
+  // All three are best-effort -- failures shouldn't prevent tests from running.
+  try { await publishTestUniverse();    } catch (_) {}
+  try { await publishExpectedTotal();   } catch (_) {}
+  try { await incrementRunnersActive(); } catch (_) {}
 };
 
 // -----------------------------------------------------------------------------
@@ -339,6 +431,9 @@ exports.mochaGlobalSetup = async function () {
 // -----------------------------------------------------------------------------
 exports.mochaGlobalTeardown = async function () {
   if (g_redis) {
+    // Best-effort DECR before we tear down the connection. Idempotent, so
+    // if SIGTERM fired first this is a no-op.
+    try { await decrementRunnersActive(); } catch (_) {}
     await g_redis.quit();
   }
 };
@@ -580,6 +675,11 @@ async function releaseClaimAndExit(signal) {
       if (owner === g_runnerId) {
         await g_redis.del(g_currentClaimKey);
       }
+    }
+    // Decrement runners_active so peers see us leaving the pool. Guarded
+    // against double-decrement by decrementRunnersActive itself.
+    if (g_redis) {
+      try { await decrementRunnersActive(); } catch (_) {}
     }
   } catch (_) {}
   try {

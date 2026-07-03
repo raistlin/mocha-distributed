@@ -54,6 +54,14 @@ function injectMockRedis(writtenResults) {
         on:      () => {},
         connect: async () => {},
         quit:    async () => {},
+        // Top-level ops used by mochaGlobalSetup / releaseClaimAndExit:
+        // expected_total publication and runners_active bookkeeping.
+        get:     async () => null,
+        set:     async () => 'OK',
+        incr:    async () => 1,
+        decr:    async () => 0,
+        expire:  async () => 1,
+        del:     async () => 1,
         multi:   mockMulti(writtenResults),
       })
     },

@@ -24,16 +24,37 @@ const redisResolved = require.resolve('redis');
 
 function makeMockClient(opts = {}) {
   const claimOwners = opts.claimOwners || {}; // testKey -> existing owner
+  const kv = new Map();                       // shared in-memory kv store
   const calls = [];
   const client = {
     calls,
+    kv,
     on:      () => {},
     connect: async () => {},
     quit:    async () => { calls.push(['quit']); },
     expire:  async (k, ttl) => { calls.push(['expire', k, ttl]); return 1; },
     get:     async (k) => {
       calls.push(['get', k]);
-      return claimOwners[k] || process.env.MOCHA_DISTRIBUTED_RUNNER_ID;
+      if (kv.has(k)) return kv.get(k);
+      if (claimOwners[k]) return claimOwners[k];
+      return null;
+    },
+    set:     async (k, v /*, opts */) => {
+      calls.push(['set', k, v]);
+      kv.set(k, String(v));
+      return 'OK';
+    },
+    incr:    async (k) => {
+      calls.push(['incr', k]);
+      const n = (parseInt(kv.get(k) || '0', 10) || 0) + 1;
+      kv.set(k, String(n));
+      return n;
+    },
+    decr:    async (k) => {
+      calls.push(['decr', k]);
+      const n = (parseInt(kv.get(k) || '0', 10) || 0) - 1;
+      kv.set(k, String(n));
+      return n;
     },
     del:     async (k) => { calls.push(['del', k]); return 1; },
     multi:   () => {
@@ -47,13 +68,14 @@ function makeMockClient(opts = {}) {
         sAdd:   (...a) => { cmds.push(['sAdd',   ...a]); return chain; },
         exec: async () => {
           calls.push(['multi', cmds.slice()]);
-          // beforeEach pipeline: SET NX + GET (+ sAdd/expire on universe)
+          // beforeEach pipeline: SET NX + GET (+ sAdd/expire on universe).
+          // Persist the SET into the kv store so later top-level GETs
+          // (e.g. the SIGTERM ownership check) see the correct owner.
           if (cmds[0] && cmds[0][0] === 'set') {
             const testKey = cmds[0][1];
             const owner = claimOwners[testKey] ||
                           process.env.MOCHA_DISTRIBUTED_RUNNER_ID;
-            // Return one result slot per command; only the second (GET)
-            // is read by the lib (destructured as [_, assignedRunnerId]).
+            if (!kv.has(testKey)) kv.set(testKey, owner);
             return [null, owner, ...cmds.slice(2).map(() => 1)];
           }
           // afterEach pipeline: rPush + expire + incr + expire (+ maybe sAdd/expire)
@@ -580,6 +602,102 @@ describe('mocha-distributed preemption resilience', function () {
       assert.strictEqual(sadKey, universeKey, 'prepopulation SADD targets test_universe');
       assert.deepStrictEqual([...members].sort(), [plainKey, serialKey].sort(),
         'prepopulation SADD carries every distinct claim key from the local pre-walk');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  describe('expected_total + runners_active bookkeeping', function () {
+    // expected_total is a global "we're done when done_tests reaches this"
+    // marker written via max-tracking (GET current, SET if local > remote).
+    // runners_active is a live-runner counter, INCRed at globalSetup and
+    // DECRed exactly once at teardown or SIGTERM.
+    let client, lib;
+
+    before(function () {
+      client = makeMockClient();
+      injectMockRedis(client);
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-total';
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-total';
+      delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
+      delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
+      delete process.env.MOCHA_DISTRIBUTED_EXPECTED_TOTAL_OVERRIDE;
+      lib = loadFreshLib();
+    });
+
+    after(function () { restoreRedis(); clearLib(); });
+
+    it('publishes expected_total (distinct claim keys) and INCR/DECRs runners_active', async function () {
+      const m = new Mocha({ reporter: 'min' });
+      m.rootHooks(lib.mochaHooks);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+
+      // 2 plain + 3 serial (share one key) = 3 distinct claim keys.
+      const suite = Suite.create(m.suite, 'total-suite');
+      suite.addTest(new Test('a', function () {}));
+      suite.addTest(new Test('b', function () {}));
+      suite.addTest(new Test('s1 [serial-x]', function () {}));
+      suite.addTest(new Test('s2 [serial-x]', function () {}));
+      suite.addTest(new Test('s3 [serial-x]', function () {}));
+
+      await new Promise(resolve => m.run(resolve));
+
+      const execId = 'pre-exec-total';
+      // expected_total should have been written with value 3.
+      assert.strictEqual(client.kv.get(`${execId}:expected_total`), '3',
+        'expected_total = number of distinct claim keys');
+
+      // runners_active: INCR once at setup, DECR once at teardown.
+      const incrs = client.calls.filter(c => c[0] === 'incr'
+                                          && c[1] === `${execId}:runners_active`);
+      const decrs = client.calls.filter(c => c[0] === 'decr'
+                                          && c[1] === `${execId}:runners_active`);
+      assert.strictEqual(incrs.length, 1, 'runners_active INCRed once');
+      assert.strictEqual(decrs.length, 1, 'runners_active DECRed once');
+      // Net value should be 0 after the run.
+      assert.strictEqual(client.kv.get(`${execId}:runners_active`), '0',
+        'runners_active net change is zero');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  describe('MOCHA_DISTRIBUTED_EXPECTED_TOTAL_OVERRIDE', function () {
+    // Escape hatch for dynamically-generated tests where the pre-walk
+    // under-counts. Documented as unsupported by default; the override
+    // env var lets the user tell us the correct total explicitly.
+    let client, lib;
+
+    before(function () {
+      client = makeMockClient();
+      injectMockRedis(client);
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-override-total';
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-override-total';
+      process.env.MOCHA_DISTRIBUTED_EXPECTED_TOTAL_OVERRIDE = '99';
+      delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
+      delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
+      lib = loadFreshLib();
+    });
+
+    after(function () {
+      delete process.env.MOCHA_DISTRIBUTED_EXPECTED_TOTAL_OVERRIDE;
+      restoreRedis();
+      clearLib();
+    });
+
+    it('uses the override value verbatim regardless of local test count', async function () {
+      const m = new Mocha({ reporter: 'min' });
+      m.rootHooks(lib.mochaHooks);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+      const suite = Suite.create(m.suite, 'override-total-suite');
+      suite.addTest(new Test('only', function () {}));
+      await new Promise(resolve => m.run(resolve));
+
+      const execId = 'pre-exec-override-total';
+      assert.strictEqual(client.kv.get(`${execId}:expected_total`), '99',
+        'override value wins over the walk-computed local count');
     });
   });
 });

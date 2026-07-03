@@ -475,8 +475,24 @@ async function runDrainIteration(orphanKeys) {
   try {
     const RunnerCtor = Mocha.Runner;
     const runner = new RunnerCtor(g_rootSuite, { delay: false });
-    // Silence any default reporter noise: don't wire one up. The lib's
-    // own drain-phase logging (added in a later step) handles user output.
+    // Per-rescue observability: emit compact log lines on the same events
+    // mocha's own reporter would use. We log the test title (not the redis
+    // key) so users can grep in kubectl-logs by the same title mocha printed
+    // during Phase A.
+    const EVENTS = RunnerCtor.constants || {};
+    const onPass = (test) => {
+      g_localRescueCount++;
+      const dur = typeof test.duration === 'number' ? `${test.duration}ms` : 'unknown';
+      console.log(`[mocha-distributed] drain: rescued "${test.title}" — passed in ${dur}`);
+    };
+    const onFail = (test) => {
+      g_localRescueCount++;
+      const dur = typeof test.duration === 'number' ? `${test.duration}ms` : 'unknown';
+      console.log(`[mocha-distributed] drain: rescued "${test.title}" — failed in ${dur}`);
+    };
+    if (EVENTS.EVENT_TEST_PASS) runner.on(EVENTS.EVENT_TEST_PASS, onPass);
+    if (EVENTS.EVENT_TEST_FAIL) runner.on(EVENTS.EVENT_TEST_FAIL, onFail);
+
     await new Promise((resolve) => runner.run(resolve));
   } catch (err) {
     console.log(`[mocha-distributed] drain: iteration errored: ${err && err.message}`);
@@ -521,6 +537,25 @@ async function runDrainLoop() {
 
   await drainPhaseBanner();
 
+  // Periodic status printer: keeps kubectl-logs readers oriented while the
+  // loop is waiting. 30s cadence is decoupled from poll interval so the
+  // status line stays readable even with a fast poll.
+  const statusIntervalMs = 30 * 1000;
+  let lastStatusAt = Date.now();
+  const printStatus = async () => {
+    try {
+      const [done, expected, active] = await Promise.all([
+        getDoneCount(), getExpectedTotal(), getRunnersActive(),
+      ]);
+      const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+      const waiting = Math.max(0, expected - done);
+      console.log(
+        `[mocha-distributed] drain: ${done}/${expected} done, ` +
+        `${waiting} waiting, ${active} runners active, elapsed ${elapsedSec}s`
+      );
+    } catch (_) { /* status is best-effort */ }
+  };
+
   while (true) {
     // Timeout check
     const elapsedMs = Date.now() - startedAt;
@@ -545,6 +580,12 @@ async function runDrainLoop() {
         `elapsed ${elapsedSec}s, this runner rescued ${g_localRescueCount} tests`
       );
       return { timedOut: false, done, expected };
+    }
+
+    // Emit a periodic status line if it's been long enough.
+    if (Date.now() - lastStatusAt >= statusIntervalMs) {
+      await printStatus();
+      lastStatusAt = Date.now();
     }
 
     // Find orphans; run them if any; otherwise sleep and re-check.

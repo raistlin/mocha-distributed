@@ -1019,7 +1019,7 @@ exports.mochaHooks = {
         Math.floor(Number(g_claimExpirationTime) / 3)
       );
       g_claimRefreshInterval = setInterval(() => {
-        g_redis.expire(testKey, g_claimExpirationTime).catch(() => {});
+        g_redis.expire(testKey, g_claimExpirationTimeSec).catch(() => {});
       }, refreshSecs * 1000);
       g_capture.stdout = captureStream(process.stdout);
       g_capture.stderr = captureStream(process.stderr);
@@ -1144,7 +1144,7 @@ exports.mochaHooks = {
     }
     if (g_currentClaimKey) {
       try {
-        await g_redis.expire(g_currentClaimKey, g_expirationTime);
+        await g_redis.expire(g_currentClaimKey, g_expirationTimeSec);
       } catch (_) {}
       g_currentClaimKey = null;
     }

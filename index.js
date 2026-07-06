@@ -847,8 +847,9 @@ exports.mochaGlobalTeardown = async function () {
     // rationale. Users can disable this with MOCHA_DISTRIBUTED_DRAIN_ENABLED
     // if they need the old "exit as soon as local iteration finishes"
     // behaviour — they should not, on preemptible infra.
+    let drainResult = null;
     if (g_drainEnabled) {
-      try { await runDrainLoop(); } catch (err) {
+      try { drainResult = await runDrainLoop(); } catch (err) {
         console.log(`[mocha-distributed] drain: aborted due to error: ${err && err.message}`);
       }
     } else {
@@ -862,7 +863,40 @@ exports.mochaGlobalTeardown = async function () {
     // Best-effort DECR before we tear down the connection. Idempotent, so
     // if SIGTERM fired first this is a no-op.
     try { await decrementRunnersActive(); } catch (_) {}
+
+    // Compute the global exit-code verdict before quitting the client.
+    // Contract (see docs/preemption-resilience-plan.md):
+    //   0  drain completed AND global failed_count is 0
+    //   1  drain completed AND global failed_count > 0
+    //   2  drain timed out
+    // We honour the contract only when drain actually ran; with drain
+    // disabled, mocha's own exit code is left alone (backwards
+    // compatibility for the escape hatch).
+    let verdict = null;
+    if (g_drainEnabled && drainResult) {
+      if (drainResult.timedOut) {
+        verdict = 2;
+      } else {
+        let failed = 0;
+        try {
+          const s = await g_redis.get(redisKeys.failedCount());
+          failed = parseInt(s || '0', 10) || 0;
+        } catch (_) { /* on read error, fall through to mocha default */ }
+        verdict = failed > 0 ? 1 : 0;
+      }
+    }
+
     await g_redis.quit();
+
+    // Apply the verdict once the client is closed. process.exit here
+    // short-circuits mocha's own exit code (which is failCount capped at
+    // 255 — not what we want for a distributed run). We defer via a
+    // process.on('exit') so any queued afterAll hooks the harness might
+    // add still run.
+    if (verdict !== null) {
+      process.exitCode = verdict;
+      process.on('exit', () => process.exit(verdict));
+    }
   }
 };
 

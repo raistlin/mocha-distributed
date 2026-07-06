@@ -1033,4 +1033,119 @@ describe('mocha-distributed preemption resilience', function () {
       lib2.__testing.setDrainPhase(false);
     });
   });
+
+  // ---------------------------------------------------------------------------
+  describe('exit-code verdict contract', function () {
+    // 0 = drain completed + zero global failures
+    // 1 = drain completed + one or more global failures
+    // 2 = drain timed out
+    //
+    // We can't observe a real process.exit inside the test, so we stub
+    // both process.exitCode and the 'exit' handler registration to
+    // capture whatever the teardown asks for.
+    let origExitCode, origOn, capturedExitHandlers;
+
+    beforeEach(function () {
+      origExitCode = process.exitCode;
+      capturedExitHandlers = [];
+      origOn = process.on.bind(process);
+      process.on = function (event, handler) {
+        if (event === 'exit') { capturedExitHandlers.push(handler); return process; }
+        return origOn(event, handler);
+      };
+    });
+    afterEach(function () {
+      process.exitCode = origExitCode;
+      process.on = origOn;
+    });
+
+    it('exits 0 when drain completes with zero global failures', async function () {
+      this.timeout(5000);
+      const client = makeMockClient();
+      injectMockRedis(client);
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-verdict-0';
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-v0';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_TIMEOUT       = '5';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_POLL_INTERVAL = '1';
+
+      const lib = loadFreshLib();
+      const m = new Mocha({ reporter: 'min' });
+      m.suite.beforeEach(lib.mochaHooks.beforeEach);
+      m.suite.afterEach(lib.mochaHooks.afterEach);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+      const suite = Suite.create(m.suite, 'v0-suite');
+      suite.addTest(new Test('happy', function () { /* passes */ }));
+
+      await new Promise(resolve => m.run(resolve));
+
+      assert.strictEqual(process.exitCode, 0,
+        'exitCode set to 0 for drain-complete + zero failures');
+      assert.strictEqual(capturedExitHandlers.length, 1,
+        'exactly one process.on("exit") handler was registered');
+
+      restoreRedis(); clearLib();
+    });
+
+    it('exits 1 when drain completes with global failures', async function () {
+      this.timeout(5000);
+      const client = makeMockClient();
+      injectMockRedis(client);
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-verdict-1';
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-v1';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_TIMEOUT       = '5';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_POLL_INTERVAL = '1';
+
+      // Pre-seed a global failure count as if another runner reported one.
+      client.kv.set('pre-exec-verdict-1:failed_count', '3');
+
+      const lib = loadFreshLib();
+      const m = new Mocha({ reporter: 'min' });
+      m.suite.beforeEach(lib.mochaHooks.beforeEach);
+      m.suite.afterEach(lib.mochaHooks.afterEach);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+      const suite = Suite.create(m.suite, 'v1-suite');
+      suite.addTest(new Test('happy', function () { /* passes locally */ }));
+
+      await new Promise(resolve => m.run(resolve));
+
+      assert.strictEqual(process.exitCode, 1,
+        'exitCode set to 1 when global failed_count > 0');
+
+      restoreRedis(); clearLib();
+    });
+
+    it('exits 2 when drain times out', async function () {
+      this.timeout(5000);
+      const client = makeMockClient();
+      injectMockRedis(client);
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-verdict-2';
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-v2';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_TIMEOUT       = '1';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_POLL_INTERVAL = '1';
+      // Force drain to never converge by inflating expected_total.
+      process.env.MOCHA_DISTRIBUTED_EXPECTED_TOTAL_OVERRIDE = '99';
+
+      const lib = loadFreshLib();
+      const m = new Mocha({ reporter: 'min' });
+      m.suite.beforeEach(lib.mochaHooks.beforeEach);
+      m.suite.afterEach(lib.mochaHooks.afterEach);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+      const suite = Suite.create(m.suite, 'v2-suite');
+      suite.addTest(new Test('happy', function () { /* passes */ }));
+
+      await new Promise(resolve => m.run(resolve));
+
+      assert.strictEqual(process.exitCode, 2,
+        'exitCode set to 2 when drain times out');
+
+      delete process.env.MOCHA_DISTRIBUTED_EXPECTED_TOTAL_OVERRIDE;
+      restoreRedis(); clearLib();
+    });
+  });
 });

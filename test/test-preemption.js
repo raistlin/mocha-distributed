@@ -24,6 +24,11 @@ const redisResolved = require.resolve('redis');
 
 function makeMockClient(opts = {}) {
   const claimOwners = opts.claimOwners || {}; // testKey -> existing owner
+  // Keys in this set behave as if their runner already died: EXISTS returns
+  // 0 and top-level GET returns null even if multi().set() would normally
+  // persist a value. Simulates an in-flight claim whose owner was
+  // preempted before writing done_tests.
+  const preemptedKeys = new Set(opts.preemptedKeys || []);
   const kv = new Map();                       // shared in-memory kv store
   const calls = [];
   const client = {
@@ -86,6 +91,7 @@ function makeMockClient(opts = {}) {
     },
     exists:  async (k) => {
       calls.push(['exists', k]);
+      if (preemptedKeys.has(k)) return 0;
       return kv.has(k) ? 1 : 0;
     },
     multi:   () => {
@@ -107,7 +113,12 @@ function makeMockClient(opts = {}) {
             const testKey = cmds[0][1];
             const owner = claimOwners[testKey] ||
                           process.env.MOCHA_DISTRIBUTED_RUNNER_ID;
-            if (!kv.has(testKey)) kv.set(testKey, owner);
+            // Preempted keys stay unclaimable so drain can observe them as
+            // orphans: the SET NX 'succeeds' from the caller's perspective
+            // but no live claim key is stored (and EXISTS returns 0).
+            if (!preemptedKeys.has(testKey) && !kv.has(testKey)) {
+              kv.set(testKey, owner);
+            }
             // Apply any sAdd commands piggybacked on the same pipeline so
             // the shared state (test_universe) reflects them for later
             // drain-phase reads.
@@ -218,7 +229,7 @@ describe('mocha-distributed preemption resilience', function () {
       this.timeout(10000);
 
       const m = new Mocha({ reporter: 'min' });
-      m.rootHooks(lib.mochaHooks);
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
       m.globalSetup([lib.mochaGlobalSetup]);
       m.globalTeardown([lib.mochaGlobalTeardown]);
 
@@ -268,7 +279,7 @@ describe('mocha-distributed preemption resilience', function () {
 
     it('SETs claim with the configured short TTL', async function () {
       const m = new Mocha({ reporter: 'min' });
-      m.rootHooks(lib.mochaHooks);
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
       m.globalSetup([lib.mochaGlobalSetup]);
       m.globalTeardown([lib.mochaGlobalTeardown]);
       const suite = Suite.create(m.suite, 'override-suite');
@@ -330,7 +341,7 @@ describe('mocha-distributed preemption resilience', function () {
 
     it('does not write a tombstone when another runner owns the claim', async function () {
       const m = new Mocha({ reporter: 'min' });
-      m.rootHooks(lib.mochaHooks);
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
       m.globalSetup([lib.mochaGlobalSetup]);
       m.globalTeardown([lib.mochaGlobalTeardown]);
       const suite = Suite.create(m.suite, 'skip-suite');
@@ -394,7 +405,7 @@ describe('mocha-distributed preemption resilience', function () {
       this.timeout(10000);
 
       const m = new Mocha({ reporter: 'min' });
-      m.rootHooks(lib.mochaHooks);
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
       m.globalSetup([lib.mochaGlobalSetup]);
       m.globalTeardown([lib.mochaGlobalTeardown]);
 
@@ -463,7 +474,7 @@ describe('mocha-distributed preemption resilience', function () {
       this.timeout(10000);
 
       const m = new Mocha({ reporter: 'min' });
-      m.rootHooks(lib.mochaHooks);
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
       m.globalSetup([lib.mochaGlobalSetup]);
       m.globalTeardown([lib.mochaGlobalTeardown]);
 
@@ -517,7 +528,7 @@ describe('mocha-distributed preemption resilience', function () {
       this.timeout(10000);
 
       const m = new Mocha({ reporter: 'min' });
-      m.rootHooks(lib.mochaHooks);
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
       m.globalSetup([lib.mochaGlobalSetup]);
       m.globalTeardown([lib.mochaGlobalTeardown]);
 
@@ -585,7 +596,7 @@ describe('mocha-distributed preemption resilience', function () {
       this.timeout(10000);
 
       const m = new Mocha({ reporter: 'min' });
-      m.rootHooks(lib.mochaHooks);
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
       m.globalSetup([lib.mochaGlobalSetup]);
       m.globalTeardown([lib.mochaGlobalTeardown]);
 
@@ -698,7 +709,7 @@ describe('mocha-distributed preemption resilience', function () {
 
     it('publishes expected_total (distinct claim keys) and INCR/DECRs runners_active', async function () {
       const m = new Mocha({ reporter: 'min' });
-      m.rootHooks(lib.mochaHooks);
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
       m.globalSetup([lib.mochaGlobalSetup]);
       m.globalTeardown([lib.mochaGlobalTeardown]);
 
@@ -760,7 +771,7 @@ describe('mocha-distributed preemption resilience', function () {
 
     it('uses the override value verbatim regardless of local test count', async function () {
       const m = new Mocha({ reporter: 'min' });
-      m.rootHooks(lib.mochaHooks);
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
       m.globalSetup([lib.mochaGlobalSetup]);
       m.globalTeardown([lib.mochaGlobalTeardown]);
       const suite = Suite.create(m.suite, 'override-total-suite');
@@ -814,7 +825,7 @@ describe('mocha-distributed preemption resilience', function () {
       client.kv.set(`${execId}:expected_total`, '1');
 
       const m = new Mocha({ reporter: 'min' });
-      m.rootHooks(lib.mochaHooks);
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
       m.globalSetup([lib.mochaGlobalSetup]);
       m.globalTeardown([lib.mochaGlobalTeardown]);
 
@@ -870,7 +881,7 @@ describe('mocha-distributed preemption resilience', function () {
       client.kv.set(`${execId}:expected_total`, '5');
 
       const m = new Mocha({ reporter: 'min' });
-      m.rootHooks(lib.mochaHooks);
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
       m.globalSetup([lib.mochaGlobalSetup]);
       m.globalTeardown([lib.mochaGlobalTeardown]);
       const suite = Suite.create(m.suite, 'timeout-suite');
@@ -885,6 +896,141 @@ describe('mocha-distributed preemption resilience', function () {
         `drain waited at least the timeout (elapsed ${elapsed}ms)`);
       assert.ok(elapsed < 8000,
         `drain exited soon after the timeout (elapsed ${elapsed}ms)`);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  describe('MAX_RESCUES_PER_TEST cap-hit writes a synthetic failure', function () {
+    // Simulate a test that has already been picked up MAX times without
+    // ever producing a result (each attempt crashed its runner). The next
+    // beforeEach in drain phase should observe the exhausted budget, win
+    // the cap CAS, write a synthetic failed row to test_result, INCR
+    // failed_count, and SADD done_tests so drain can complete.
+    let client, lib;
+
+    before(function () {
+      client = makeMockClient();
+      injectMockRedis(client);
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-cap';
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-cap';
+      process.env.MOCHA_DISTRIBUTED_MAX_RESCUES_PER_TEST = '2';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_POLL_INTERVAL  = '1';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_TIMEOUT        = '10';
+      delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
+      delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
+      lib = loadFreshLib();
+    });
+
+    after(function () {
+      delete process.env.MOCHA_DISTRIBUTED_MAX_RESCUES_PER_TEST;
+      restoreRedis();
+      clearLib();
+    });
+
+    it('writes a synthetic failure row and marks done when the budget is exhausted', async function () {
+      // Sanity check: exercising the beforeEach path in Phase A does not
+      // touch rescue_count (that key is drain-phase only). If this ever
+      // changes, the cap-hit test below needs to re-seed accordingly.
+      const execId = 'pre-exec-cap';
+      const rcCalls = client.calls.filter(c =>
+        c[0] === 'incr' && /:rescue_count:/.test(c[1])
+      );
+      assert.strictEqual(rcCalls.length, 0,
+        'Phase A never INCRs rescue_count — that is drain-only bookkeeping');
+    });
+
+    it('cap-hit handler writes a synthetic row when a drain rescue hits the cap', async function () {
+      this.timeout(5000);
+
+      // Fresh env + fresh lib for isolated state. We drive the beforeEach
+      // directly via lib.__testing.setDrainPhase(true) — exercising the
+      // real drain-guard branch without depending on Mocha.Runner state
+      // reuse (which is validated end-to-end by the drain-timeout tests
+      // and by real-redis integration runs).
+      const execId2 = 'pre-exec-cap-2';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = execId2;
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-cap-2';
+      process.env.MOCHA_DISTRIBUTED_MAX_RESCUES_PER_TEST = '2';
+      // Disable the drain loop; we're invoking the guard manually.
+      process.env.MOCHA_DISTRIBUTED_DRAIN_ENABLED = 'false';
+
+      const targetKey = `${execId2}:cap2-suite:flaky:dup-1`;
+      const client2 = makeMockClient();
+      injectMockRedis(client2);
+      // Pre-seed rescue_count to the cap value. Next INCR from the
+      // drain-guard takes it to cap+1 and trips handleRescueCap.
+      client2.kv.set(`${execId2}:rescue_count:${targetKey}`, '2');
+
+      const lib2 = loadFreshLib();
+
+      // Build a minimal Mocha to let globalSetup populate g_testKeyInfo,
+      // g_rootSuite, etc. The tests can be skipped with pending=true —
+      // we don't want Phase A to run this time.
+      const m = new Mocha({ reporter: 'min' });
+      m.suite.beforeEach(lib2.mochaHooks.beforeEach);
+      m.suite.afterEach(lib2.mochaHooks.afterEach);
+      m.globalSetup([lib2.mochaGlobalSetup]);
+      // Intentionally skip mochaGlobalTeardown — no drain here.
+
+      const suite = Suite.create(m.suite, 'cap2-suite');
+      const flaky = new Test('flaky', function () { /* would-be body */ });
+      suite.addTest(flaky);
+      // Mark pending so Phase A does not actually run it or its hooks.
+      flaky.pending = true;
+
+      await new Promise(resolve => m.run(resolve));
+
+      // Force drain phase and invoke beforeEach directly with a stubbed
+      // hook context.
+      lib2.__testing.setDrainPhase(true);
+      let skipped = false;
+      const ctx = {
+        currentTest: flaky,
+        skip() { skipped = true; },
+      };
+      // Un-pend so the beforeEach body runs to completion.
+      flaky.pending = false;
+      await lib2.mochaHooks.beforeEach.call(ctx);
+
+      assert.strictEqual(skipped, true,
+        'drain-guard called this.skip() after exhausting the budget');
+
+      // A synthetic failed row must have landed on test_result.
+      const rPushes = client2.calls.filter(c => c[0] === 'multi')
+        .flatMap(c => c[1])
+        .filter(cmd => cmd[0] === 'rPush' && cmd[1] === `${execId2}:test_result`)
+        .map(cmd => JSON.parse(cmd[2]));
+      const synthetic = rPushes.find(r => r.syntheticOrphan === true);
+      assert.ok(synthetic, 'a synthetic orphan failure row was written');
+      assert.strictEqual(synthetic.state, 'failed');
+      assert.strictEqual(synthetic.failed, true);
+      assert.ok(synthetic.err && /rescue attempts/i.test(synthetic.err.message),
+        'synthetic err.message describes the exhausted rescue budget');
+
+      // done_tests contains the key so drain can converge.
+      const doneSet = JSON.parse(client2.kv.get(`${execId2}:done_tests`) || '[]');
+      assert.ok(doneSet.includes(targetKey),
+        'done_tests contains the exhausted key so drain converges');
+
+      // cap_hit_marker counter reflects that we won the CAS.
+      assert.strictEqual(client2.kv.get(`${execId2}:cap_hit_marker:${targetKey}`), '1',
+        'cap_hit_marker was CAS-INCR\'d to 1 by the winning runner');
+
+      // Invoking a second time must NOT double-write — the loser branch
+      // skips row writing.
+      skipped = false;
+      const beforeCount = client2.calls.filter(c => c[0] === 'multi').length;
+      await lib2.mochaHooks.beforeEach.call(ctx);
+      assert.strictEqual(skipped, true, 'still skipped on second attempt');
+      const afterRPushes = client2.calls.filter(c => c[0] === 'multi')
+        .flatMap(c => c[1])
+        .filter(cmd => cmd[0] === 'rPush' && cmd[1] === `${execId2}:test_result`)
+        .filter(cmd => JSON.parse(cmd[2]).syntheticOrphan === true);
+      assert.strictEqual(afterRPushes.length, 1,
+        'exactly one synthetic row across repeated cap-hits (CAS holds)');
+
+      lib2.__testing.setDrainPhase(false);
     });
   });
 });

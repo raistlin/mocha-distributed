@@ -42,6 +42,10 @@ const redisKeys = {
   doneTests: () => `${g_testExecutionId}:done_tests`,
   expectedTotal: () => `${g_testExecutionId}:expected_total`,
   runnersActive: () => `${g_testExecutionId}:runners_active`,
+  capHitMarker: (testKey) => `${g_testExecutionId}:cap_hit_marker:${testKey}`,
+  rescueCount: (testKey) => `${g_testExecutionId}:rescue_count:${testKey}`,
+  testResult: () => `${g_testExecutionId}:test_result`,
+  failedCount: () => `${g_testExecutionId}:failed_count`,
 };
 
 // Generate a unique random id for this runner (with almost 100% certainty
@@ -91,6 +95,21 @@ let g_drainPhase = false;
 // the completion banner — useful for post-hoc analysis of which pods did
 // the rescuing work.
 let g_localRescueCount = 0;
+
+// Reverse map: serial-group key -> [Test, ...]. Populated in computeTestKeys
+// so the cap-hit handler can enumerate every test belonging to a failing
+// serial group and write one synthetic result row per test (see docs plan
+// Q12 — individual failure rows read more naturally to external reporters
+// than a single group-level row).
+const g_serialGroupTests = new Map();
+
+// Rescue budget per test. When a test has been picked up by the drain
+// phase this many times without producing a result, it's declared broken
+// (crashes its runner) and a synthetic failure row is written on its behalf.
+const g_maxRescuesPerTest = Math.max(
+  1,
+  parseInt(process.env.MOCHA_DISTRIBUTED_MAX_RESCUES_PER_TEST || "3", 10) || 3
+);
 
 // Drain configuration. All have documented defaults; see docs plan.
 const g_drainEnabled =
@@ -274,6 +293,15 @@ function computeTestKeys(rootSuite) {
     if (info) info.isLastInSerialGroup = true;
   }
 
+  // Expose serial-group membership for the cap-hit handler (see
+  // handleRescueCap). Cleared before repopulating so repeated invocations
+  // — not expected in production, but common in tests — don't leak stale
+  // entries.
+  g_serialGroupTests.clear();
+  for (const [key, members] of serialGroupMembers) {
+    g_serialGroupTests.set(key, members.slice());
+  }
+
   // Count distinct claim keys: serial groups collapse to one key regardless
   // of member count, plain tests contribute one each (with :dup-N making
   // duplicated titles distinct). This is what expected_total is compared
@@ -343,6 +371,86 @@ async function decrementRunnersActive() {
     const key = redisKeys.runnersActive();
     await g_redis.decr(key);
   } catch (_) { /* best-effort during shutdown */ }
+}
+
+// -----------------------------------------------------------------------------
+// handleRescueCap
+//
+// Called from beforeEach when a drain-phase attempt would exceed the
+// per-test rescue budget. If we win the CAS (single-writer INCR on the
+// cap_hit_marker key), we write a synthetic failure row for each test in
+// the affected group so external reporters see a normal terminal state,
+// mark the key as done, and bump failed_count. The current attempt is
+// then skipped so we don't run a broken test yet again.
+//
+// If the CAS is lost (another runner got here first), we just skip — the
+// other runner is responsible for writing the synthetic row.
+// -----------------------------------------------------------------------------
+async function handleRescueCap(testKey, currentTest, attempts) {
+  const markerKey = redisKeys.capHitMarker(testKey);
+  let winner = false;
+  try {
+    const n = await g_redis.incr(markerKey);
+    await g_redis.expire(markerKey, g_expirationTimeSec);
+    winner = (n === 1);
+  } catch (_) { /* if INCR fails, be conservative and don't write */ }
+
+  if (!winner) return;
+
+  const info = g_testKeyInfo.get(currentTest);
+  const affected =
+    info && info.isSerial && g_serialGroupTests.has(testKey)
+      ? g_serialGroupTests.get(testKey)
+      : [currentTest];
+
+  const resultKey = redisKeys.testResult();
+  const countKey  = redisKeys.failedCount();
+  const doneKey   = redisKeys.doneTests();
+
+  const now = Date.now();
+  const errObj = {
+    message: `Test orphaned after ${attempts} rescue attempts; ` +
+             `likely crashes its runner. See MOCHA_DISTRIBUTED_MAX_RESCUES_PER_TEST.`,
+  };
+
+  try {
+    let pipe = g_redis.multi();
+    for (const t of affected) {
+      const row = {
+        id: getTestPathFromTest(t),
+        type: t.type || 'test',
+        title: t.title,
+        timedOut: false,
+        duration: 0,
+        startTime: now,
+        endTime: now,
+        retryAttempt: attempts,
+        retryTotal: attempts,
+        file: t.file,
+        state: 'failed',
+        failed: true,
+        err: errObj,
+        stdout: '',
+        stderr: '',
+        syntheticOrphan: true,
+      };
+      pipe = pipe
+        .rPush(resultKey, JSON.stringify(row))
+        .incr(countKey);
+    }
+    pipe = pipe
+      .expire(resultKey, g_expirationTimeSec)
+      .expire(countKey,  g_expirationTimeSec)
+      .sAdd(doneKey, testKey)
+      .expire(doneKey, g_expirationTimeSec);
+    await pipe.exec();
+  } catch (_) { /* best-effort */ }
+
+  console.log(
+    `[mocha-distributed] drain: ERROR test "${currentTest.title}" ` +
+    `exhausted rescue budget (${attempts}/${g_maxRescuesPerTest}), ` +
+    `marking as failed`
+  );
 }
 
 // -----------------------------------------------------------------------------
@@ -466,10 +574,20 @@ async function runDrainIteration(orphanKeys) {
       test.pending = true;
       return;
     }
-    // Skip tests whose canonical key is not among the current orphans.
-    // Mocha short-circuits `pending` tests before hooks fire, so beforeEach
-    // won't issue any redis ops for these — zero waste per drain iteration.
-    test.pending = !(info && orphanSet.has(info.key));
+    const shouldRun = info && orphanSet.has(info.key);
+    test.pending = !shouldRun;
+    if (shouldRun) {
+      // Clear leftover state from Phase A so the fresh Runner treats
+      // this as a first-time execution. Without this, mocha's internal
+      // hook machinery can carry over the previous "skipped" verdict
+      // and short-circuit before beforeEach fires.
+      test.state    = undefined;
+      test.timedOut = false;
+      test.duration = undefined;
+      test.speed    = undefined;
+      test.err      = undefined;
+      if (typeof test._currentRetry === 'number') test._currentRetry = 0;
+    }
   });
 
   try {
@@ -754,6 +872,21 @@ exports.mochaGlobalTeardown = async function () {
 // Please note that we run skip before each test if the ownership of it has
 // already been defined by another runner.
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Test-only entry points
+//
+// Exposed to let unit tests invoke internal helpers directly — in
+// particular the drain-phase beforeEach path (with g_drainPhase forced on)
+// and the cap-hit handler. Not part of the public API.
+// -----------------------------------------------------------------------------
+exports.__testing = {
+  setDrainPhase(v) { g_drainPhase = !!v; },
+  isDrainPhase()   { return g_drainPhase; },
+  handleRescueCap,
+  computeTestKeys,
+  computeOrphans,
+};
+
 exports.mochaHooks = {
   beforeEach: async function () {
     // Prefer the pre-walk key when present; fall back to the historical
@@ -805,6 +938,23 @@ exports.mochaHooks = {
 
     const testKey =
       g_granularity === GRANULARITY.TEST ? testKeyFullPath : testKeySuite;
+
+    // Drain-phase rescue budget: if this runner is in drain (not the
+    // initial iteration), bump the per-test counter and check the cap
+    // before attempting to claim. On cap exhaustion, write a synthetic
+    // failure row via the CAS-guarded handler and skip.
+    if (g_drainPhase) {
+      try {
+        const rcKey = redisKeys.rescueCount(testKey);
+        const attempts = await g_redis.incr(rcKey);
+        await g_redis.expire(rcKey, g_expirationTimeSec);
+        if (attempts > g_maxRescuesPerTest) {
+          await handleRescueCap(testKey, this.currentTest, attempts);
+          this.currentTest.title += ' (rescue budget exhausted)';
+          return this.skip();
+        }
+      } catch (_) { /* best-effort; fall through to normal claim */ }
+    }
 
     // Atomically set/get the runner id associated to this test. Only the first
     // runner to get there will set the value to its own runner id.

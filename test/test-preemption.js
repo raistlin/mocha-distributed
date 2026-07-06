@@ -1148,4 +1148,76 @@ describe('mocha-distributed preemption resilience', function () {
       restoreRedis(); clearLib();
     });
   });
+
+  // ---------------------------------------------------------------------------
+  describe('MOCHA_DISTRIBUTED_DRAIN_ENABLED=false escape hatch', function () {
+    it('skips the drain loop, logs the WARN banner, and leaves exitCode alone', async function () {
+      this.timeout(5000);
+
+      // Capture console.log output to inspect the WARN banner.
+      const logs = [];
+      const origLog = console.log;
+      console.log = (...args) => { logs.push(args.join(' ')); };
+
+      // Stub process.on('exit') so the verdict override (if any) is
+      // observable but non-fatal.
+      const capturedExit = [];
+      const origOn = process.on.bind(process);
+      process.on = function (event, handler) {
+        if (event === 'exit') { capturedExit.push(handler); return process; }
+        return origOn(event, handler);
+      };
+      const origExitCode = process.exitCode;
+
+      try {
+        const client = makeMockClient();
+        injectMockRedis(client);
+        process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+        process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-disabled';
+        process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-dis';
+        process.env.MOCHA_DISTRIBUTED_DRAIN_ENABLED = 'false';
+        // Pre-seed a wildly high expected_total: if the drain loop ran
+        // it would spin waiting for it. It must NOT run.
+        client.kv.set('pre-exec-disabled:expected_total', '999');
+
+        const lib = loadFreshLib();
+        const m = new Mocha({ reporter: 'min' });
+        m.suite.beforeEach(lib.mochaHooks.beforeEach);
+        m.suite.afterEach(lib.mochaHooks.afterEach);
+        m.globalSetup([lib.mochaGlobalSetup]);
+        m.globalTeardown([lib.mochaGlobalTeardown]);
+        const suite = Suite.create(m.suite, 'disabled-suite');
+        suite.addTest(new Test('happy', function () { /* passes */ }));
+
+        const started = Date.now();
+        await new Promise(resolve => m.run(resolve));
+        const elapsed = Date.now() - started;
+
+        // Must exit promptly (well under any drain timeout).
+        assert.ok(elapsed < 2500,
+          `teardown returned promptly when DRAIN_ENABLED=false (elapsed ${elapsed}ms)`);
+
+        // No drain-phase banner, no verdict override.
+        const drainBannerSeen = logs.some(l => /Entering drain phase/.test(l));
+        assert.strictEqual(drainBannerSeen, false,
+          'the drain banner was NOT printed when DRAIN_ENABLED=false');
+
+        const warnSeen = logs.some(l =>
+          /MOCHA_DISTRIBUTED_DRAIN_ENABLED=false/.test(l) && /WARN/.test(l));
+        assert.ok(warnSeen,
+          'a WARN line about the disabled drain was printed');
+
+        // Verdict override skipped: process.exitCode is whatever mocha set
+        // (typically undefined for a passing run), and no 'exit' handler
+        // was queued by the lib.
+        assert.strictEqual(capturedExit.length, 0,
+          'no verdict process.on("exit") handler was queued');
+      } finally {
+        console.log = origLog;
+        process.on = origOn;
+        process.exitCode = origExitCode;
+        restoreRedis(); clearLib();
+      }
+    });
+  });
 });

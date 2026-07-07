@@ -41,6 +41,7 @@ const redisKeys = {
   testUniverse: () => `${g_testExecutionId}:test_universe`,
   doneTests: () => `${g_testExecutionId}:done_tests`,
   expectedTotal: () => `${g_testExecutionId}:expected_total`,
+  expectedTotalIndividual: () => `${g_testExecutionId}:expected_total_individual`,
   runnersActive: () => `${g_testExecutionId}:runners_active`,
   capHitMarker: (testKey) => `${g_testExecutionId}:cap_hit_marker:${testKey}`,
   rescueCount: (testKey) => `${g_testExecutionId}:rescue_count:${testKey}`,
@@ -79,6 +80,13 @@ let g_runnersActiveDecremented = false;
 // expected_total in redis via max-tracking, and later as a fast local
 // check during drain.
 let g_localExpectedCount = 0;
+
+// Raw count of individual Test objects walked, before [serial-*] collapsing.
+// expected_total counts coordination units (a whole serial group is one
+// unit), which undercounts the true number of tests whenever serial groups
+// are used. Published separately so consumers that want an exact "how many
+// tests" figure aren't stuck with the coordination-unit number.
+let g_localIndividualTestCount = 0;
 
 // Reference to the root Suite captured at globalSetup. The drain phase
 // reuses it to build fresh Mocha.Runner instances that re-execute only
@@ -261,7 +269,9 @@ function computeTestKeys(rootSuite) {
   const serialGroupMembers = new Map();     // serial key -> [Test, ...]
 
   g_localTestKeys.clear();
+  g_localIndividualTestCount = 0;
   walkSuite(rootSuite, (test) => {
+    g_localIndividualTestCount += 1;
     const path = getTestPathFromTest(test);
     const joined = path.join(":");
     const isSerial = joined.indexOf(SERIAL_PREFIX) !== -1;
@@ -347,6 +357,28 @@ async function publishExpectedTotal() {
       `detected, drain may not converge. Ensure all runners use the same ` +
       `test files and the same --grep / .only() configuration.`
     );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// publishIndividualExpectedTotal
+//
+// Same max-tracking publication as publishExpectedTotal, but for the raw
+// per-test walk count (g_localIndividualTestCount) rather than the
+// coordination-unit count. Diagnostic only - nothing in the claim/drain
+// logic reads this back, so a stale or missing value can't affect
+// correctness, only the accuracy of anything displaying it.
+// -----------------------------------------------------------------------------
+async function publishIndividualExpectedTotal() {
+  const local = g_localIndividualTestCount;
+  if (local <= 0) return;
+
+  const key = redisKeys.expectedTotalIndividual();
+  const raw = await g_redis.get(key);
+  const remote = parseInt(raw || '0', 10) || 0;
+
+  if (local > remote) {
+    await g_redis.set(key, String(local), { EX: g_expirationTimeSec });
   }
 }
 
@@ -829,11 +861,16 @@ exports.mochaGlobalSetup = async function () {
   //   - test_universe  : full local key set, published upfront so a test
   //                       whose every attempt is preempted before its
   //                       beforeEach fires is still discoverable as an orphan.
-  //   - expected_total : max across runners of local test count.
+  //   - expected_total : max across runners of local test count (a whole
+  //                       [serial-*] group counts as one unit here).
+  //   - expected_total_individual : same max-tracking, but the raw
+  //                       per-test walk count - diagnostic only, not read
+  //                       by any coordination/drain logic.
   //   - runners_active : live runner counter, INCR here / DECR at teardown.
-  // All three are best-effort -- failures shouldn't prevent tests from running.
+  // All four are best-effort -- failures shouldn't prevent tests from running.
   try { await publishTestUniverse();    } catch (_) {}
   try { await publishExpectedTotal();   } catch (_) {}
+  try { await publishIndividualExpectedTotal(); } catch (_) {}
   try { await incrementRunnersActive(); } catch (_) {}
 };
 

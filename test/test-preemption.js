@@ -851,6 +851,72 @@ describe('mocha-distributed preemption resilience', function () {
   });
 
   // ---------------------------------------------------------------------------
+  describe('drain phase does not re-invoke unrelated suites\' before/after-all hooks', function () {
+    // runDrainIteration walks the *entire* shared root Suite on every poll,
+    // toggling test.pending per orphan key. But mocha's Runner invokes a
+    // suite's before-all/after-all hooks whenever it enters that suite,
+    // regardless of whether any child test is pending (Runner.runSuite's
+    // total = grepTotal(suite) counts tests matching --grep, not
+    // non-pending tests, so it is never 0 just because everything inside
+    // is skipped). That means a suite that already finished cleanly in
+    // Phase A gets its before-all/after-all hooks re-run on every single
+    // drain iteration, for as long as ANY orphan exists anywhere in the
+    // tree -- observed in production as repeated hook-failure log lines
+    // for suites unrelated to the actual orphan (see
+    // docs/preemption-resilience-plan.md gap: hooks are never mentioned).
+    let client, lib;
+
+    before(function () {
+      client = makeMockClient();
+      injectMockRedis(client);
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-hookleak';
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-hookleak';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_POLL_INTERVAL = '1';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_TIMEOUT      = '3';
+      delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
+      delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
+      lib = loadFreshLib();
+    });
+
+    after(function () { restoreRedis(); clearLib(); });
+
+    it('only runs a completed suite\'s before-all/after-all hooks once, even across multiple drain iterations', async function () {
+      this.timeout(15000);
+
+      const execId = 'pre-exec-hookleak';
+      // A second, unresolvable orphan (no local runner will ever produce
+      // it) forces the drain loop to poll more than once before giving up
+      // at DRAIN_TIMEOUT -- long enough to observe whether an unrelated,
+      // already-finished suite's hooks fire again on a later iteration.
+      const stuckOrphanKey = `${execId}:stuck-suite:stuck:dup-1`;
+      client.kv.set(`${execId}:test_universe`, JSON.stringify([stuckOrphanKey]));
+      client.kv.set(`${execId}:expected_total`, '2');
+
+      const m = new Mocha({ reporter: 'min' });
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+
+      let beforeAllCount = 0;
+      let afterAllCount = 0;
+      const otherSuite = Suite.create(m.suite, 'other-suite');
+      otherSuite.beforeAll(function () { beforeAllCount++; });
+      otherSuite.afterAll(function () { afterAllCount++; });
+      otherSuite.addTest(new Test('finishes-in-phase-a', function () {}));
+
+      await new Promise(resolve => m.run(resolve));
+
+      assert.strictEqual(beforeAllCount, 1,
+        `other-suite's before-all hook should run exactly once, during ` +
+        `Phase A, not once per drain iteration (ran ${beforeAllCount} times)`);
+      assert.strictEqual(afterAllCount, 1,
+        `other-suite's after-all hook should run exactly once, during ` +
+        `Phase A, not once per drain iteration (ran ${afterAllCount} times)`);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   describe('drain phase respects the timeout', function () {
     // If drain cannot converge (e.g. an orphan key exists but no runner
     // has the test file to re-run it), the loop must exit within the

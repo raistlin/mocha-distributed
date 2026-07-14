@@ -199,6 +199,41 @@ function walkSuite(suite, visit) {
 }
 
 // -----------------------------------------------------------------------------
+// walkSuiteTree
+//
+// Like walkSuite, but yields every Suite object itself (not the Tests inside
+// them), root's children downward. Used by drain-phase hook-skip filtering,
+// which needs to inspect/patch Suite-level hooks rather than tests.
+// -----------------------------------------------------------------------------
+function walkSuiteTree(suite, visit) {
+  if (!suite) return;
+  for (const child of suite.suites || []) {
+    visit(child);
+    walkSuiteTree(child, visit);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// suiteHasKeyInSubtree
+//
+// True if any Test anywhere in this suite's subtree (including nested child
+// suites) has a claim key present in `keySet`. Used by drain-phase hook-skip
+// filtering to decide whether a suite legitimately needs to run this
+// iteration, or whether its before-all/after-all hooks would otherwise fire
+// for nothing (see the drain-phase hook-skip note on runDrainIteration).
+// -----------------------------------------------------------------------------
+function suiteHasKeyInSubtree(suite, keySet) {
+  for (const test of suite.tests || []) {
+    const info = g_testKeyInfo.get(test);
+    if (info && keySet.has(info.key)) return true;
+  }
+  for (const child of suite.suites || []) {
+    if (suiteHasKeyInSubtree(child, keySet)) return true;
+  }
+  return false;
+}
+
+// -----------------------------------------------------------------------------
 // buildTestKeyFromPath
 //
 // Given a test's title-path array (root -> leaf, excluding the root suite),
@@ -580,14 +615,54 @@ async function getRunnersActive() {
 }
 
 // -----------------------------------------------------------------------------
+// preserveHookAndTestFnReferences / restoreHookAndTestFnReferences
+//
+// Mocha.prototype.run always passes cleanReferencesAfterRun: true to its
+// Runner, which deletes every Test's and Hook's `.fn` as soon as its suite's
+// EVENT_SUITE_END fires (Suite.prototype.cleanReferences, mocha/lib/suite.js)
+// -- a GC aid that assumes the Suite tree is discarded after that one run.
+//
+// Drain-phase rescue (runDrainIteration, below) reuses the SAME Suite tree
+// across a brand-new Runner once Phase A finishes. Runner.runSuite's
+// grepTotal counts tests regardless of `pending`, so EVERY suite in the
+// tree -- not just ones with failed/incomplete tests -- is entered and
+// cleaned during Phase A. By the time drain starts, every Test and every
+// before/after-all Hook has already had its `.fn` deleted, so re-running any
+// of them throws "Cannot read properties of undefined (reading 'call')" --
+// silently reported as a hook/test failure rather than a crash. This is why
+// a rescued orphan never actually re-executes (see docs/preemption-resilience-
+// plan.md, which never anticipated this: it assumed the Suite tree was
+// "safely reusable" as-is).
+//
+// mocha-distributed doesn't control how the consuming project constructs
+// its Mocha instance, so it can't just pass cleanReferencesAfterRun: false
+// itself -- monkeypatching Suite.prototype (once, from mochaGlobalSetup,
+// before Phase A's first EVENT_SUITE_END) is the only lever available. Only
+// applied when drain is enabled, so the non-drain fast path keeps mocha's
+// normal GC behaviour; restored in mochaGlobalTeardown once drain is done.
+// -----------------------------------------------------------------------------
+let g_originalCleanReferences = null;
+function preserveHookAndTestFnReferences() {
+  if (!g_drainEnabled || g_originalCleanReferences) return;
+  g_originalCleanReferences = Mocha.Suite.prototype.cleanReferences;
+  Mocha.Suite.prototype.cleanReferences = function () {};
+}
+function restoreHookAndTestFnReferences() {
+  if (!g_originalCleanReferences) return;
+  Mocha.Suite.prototype.cleanReferences = g_originalCleanReferences;
+  g_originalCleanReferences = null;
+}
+
+// -----------------------------------------------------------------------------
 // runDrainIteration
 //
 // Re-execute the given orphan keys by walking the shared root Suite,
 // marking non-orphans as pending, and driving a fresh Mocha.Runner over
 // the tree. Uses public mocha API (Suite + Runner) to avoid reaching into
-// internals; the reason we keep the root Suite alive across iterations is
-// that Mocha's Runner is single-use once it has emitted its terminal
-// EVENT_RUN_END, but the Suite tree itself is safely reusable.
+// internals; the Suite tree is kept alive across iterations because Mocha's
+// Runner is single-use once it has emitted its terminal EVENT_RUN_END, and
+// (as of preserveHookAndTestFnReferences, above) its Test/Hook `.fn`
+// references are now kept intact so re-running them works.
 //
 // The claim/skip machinery in beforeEach continues to work naturally:
 // several drain-phase runners may race on the same orphan, but SET NX
@@ -622,6 +697,28 @@ async function runDrainIteration(orphanKeys) {
     }
   });
 
+  // Runner.runSuite enters every suite regardless of how many of its tests
+  // are pending (its `total` guard counts tests matching --grep, not
+  // non-pending ones), so a suite with no orphan anywhere in its subtree
+  // would still have its before-all/after-all hooks invoked for nothing
+  // every single iteration. Wrap those hooks to a no-op — not this.skip():
+  // mocha's Runner.prototype.hook explicitly forbids this.skip() from an
+  // after-all hook (`this.skip\` forbidden`), and we already manage
+  // test.pending ourselves above, so we don't need skip()'s cascading
+  // side effect anyway. Restore the original function once this
+  // iteration's Runner finishes.
+  const skippedHooks = [];
+  walkSuiteTree(g_rootSuite, (suite) => {
+    if (suiteHasKeyInSubtree(suite, orphanSet)) return;
+    for (const hook of [...(suite._beforeAll || []), ...(suite._afterAll || [])]) {
+      if (hook.__mdOriginalFn) continue; // already wrapped by an ancestor call
+      const originalFn = hook.fn;
+      hook.__mdOriginalFn = originalFn;
+      hook.fn = function mdSkipHook() {};
+      skippedHooks.push(hook);
+    }
+  });
+
   try {
     const RunnerCtor = Mocha.Runner;
     const runner = new RunnerCtor(g_rootSuite, { delay: false });
@@ -635,10 +732,11 @@ async function runDrainIteration(orphanKeys) {
       const dur = typeof test.duration === 'number' ? `${test.duration}ms` : 'unknown';
       console.log(`[mocha-distributed] drain: rescued "${test.title}" — passed in ${dur}`);
     };
-    const onFail = (test) => {
+    const onFail = (test, err) => {
       g_localRescueCount++;
       const dur = typeof test.duration === 'number' ? `${test.duration}ms` : 'unknown';
-      console.log(`[mocha-distributed] drain: rescued "${test.title}" — failed in ${dur}`);
+      const reason = err && err.message ? ` — ${err.message}` : '';
+      console.log(`[mocha-distributed] drain: rescued "${test.title}" — failed in ${dur}${reason}`);
     };
     if (EVENTS.EVENT_TEST_PASS) runner.on(EVENTS.EVENT_TEST_PASS, onPass);
     if (EVENTS.EVENT_TEST_FAIL) runner.on(EVENTS.EVENT_TEST_FAIL, onFail);
@@ -646,6 +744,11 @@ async function runDrainIteration(orphanKeys) {
     await new Promise((resolve) => runner.run(resolve));
   } catch (err) {
     console.log(`[mocha-distributed] drain: iteration errored: ${err && err.message}`);
+  } finally {
+    for (const hook of skippedHooks) {
+      hook.fn = hook.__mdOriginalFn;
+      delete hook.__mdOriginalFn;
+    }
   }
 }
 
@@ -804,6 +907,10 @@ function captureStream(stream) {
 // Initialize redis once before the tests
 // -----------------------------------------------------------------------------
 exports.mochaGlobalSetup = async function () {
+  // Must happen before Phase A runs any suite — see
+  // preserveHookAndTestFnReferences above for why.
+  preserveHookAndTestFnReferences();
+
   // `this` is the Mocha Runner — store errors from non-final retry attempts
   // so afterEach can record them (Mocha never sets test.err for those).
   this.on('retry', (test, err) => {
@@ -896,6 +1003,10 @@ exports.mochaGlobalTeardown = async function () {
         `still executing tests, orphaning any tests preempted afterward.`
       );
     }
+
+    // Drain (if any) is done re-running rescued orphans — safe to restore
+    // Mocha's normal cleanup behaviour now.
+    restoreHookAndTestFnReferences();
 
     // Best-effort DECR before we tear down the connection. Idempotent, so
     // if SIGTERM fired first this is a no-op.

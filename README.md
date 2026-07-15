@@ -259,7 +259,8 @@ You will see something like this on each of the items of the list:
     "state": "passed",
     "failed": false,
     "speed": "slow",
-    "err": 0
+    "err": 0,
+    "reportKey": "suite-1-async:test-1.1-async:dup-1"
   }
   ```
 
@@ -272,9 +273,72 @@ Keep in mind that:
   because sometimes is handy to have this when reading results back.
 * You can access test_result, passed_count and failed_count in redis
 * Skipped tests are never saved in redis by design, unfortunately
+* `reportKey` is the field name for this test in the collapsed `{execId}:report`
+  hash (see below) — use it directly with `HGET {execId}:report <reportKey>`
+  instead of recomputing it: the `:dup-N` suffix depends on suite-walk
+  registration order and can't be reliably reconstructed from redis data alone
+  when titles are duplicated.
 
 You might have a look at list-tests-from-redis.js for an example on how to
 query redis and list all tests.
+
+## Collapsed reports (one entry per test)
+
+In addition to `{execId}:test_result` (one LIST entry per attempt, including
+retries), mocha-distributed also maintains `{execId}:report` — a redis
+**HASH** with exactly one field per logical test, regardless of how many
+times it was retried. It's written by the same `afterEach` step that writes
+`test_result` (and by the drain-phase rescue-cap handler for orphaned tests),
+so it shares `test_result`'s TTL and, like `test_result`, never gets an entry
+for skipped tests.
+
+Each hash field's value looks like this:
+
+  ```json
+  {
+    "reportKey": "suite-1-async:test-1.1-async:dup-1",
+    "id": ["suite-1-async", "test-1.1-async"],
+    "type": "test",
+    "title": "test-1.1-async",
+    "timedOut": false,
+    "duration": 502,
+    "startTime": 1642705594300,
+    "endTime": 1642705594802,
+    "retryTotal": 1,
+    "file": "/home/psanchez/github/mocha-distributed/example/suite-1.js",
+    "state": "passed",
+    "failed": false,
+    "speed": "slow",
+    "err": null,
+    "stdout": "",
+    "stderr": "",
+    "attempts": [
+      {
+        "retryAttempt": 0,
+        "duration": 502,
+        "state": "passed",
+        "timedOut": false,
+        "err": null,
+        "stdout": "",
+        "stderr": ""
+      }
+    ]
+  }
+  ```
+
+The top-level fields (`state`, `failed`, `timedOut`, `duration`, `err`,
+`stdout`, `stderr`, `speed`, `endTime`) always reflect the **final** attempt.
+`startTime` is the **first** attempt's start, so `endTime - startTime` gives
+the total wall-clock span across every retry. `retryTotal` stays at the top
+level; the per-attempt `retryAttempt` moves into `attempts[]`, which keeps
+one entry per attempt in the order they ran.
+
+Use `HGETALL {execId}:report` to fetch every collapsed test result in one
+call, or `HGET {execId}:report <field>` for a single test. `reportKey` is
+included in the value itself (not just as the hash field name) so a row
+pulled via `HGETALL` is self-describing, and — as noted above — the same
+`reportKey` is stamped onto every `test_result` row for that test, so you can
+go from one to the other without recomputing anything.
 
 ## Run tests serially
 

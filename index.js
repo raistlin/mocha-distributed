@@ -47,6 +47,7 @@ const redisKeys = {
   rescueCount: (testKey) => `${g_testExecutionId}:rescue_count:${testKey}`,
   testResult: () => `${g_testExecutionId}:test_result`,
   failedCount: () => `${g_testExecutionId}:failed_count`,
+  report: () => `${g_testExecutionId}:report`,
 };
 
 // Generate a unique random id for this runner (with almost 100% certainty
@@ -70,6 +71,10 @@ let g_capture = { stdout: null, stderr: null };
 // after completion, and DEL it on SIGTERM.
 let g_currentClaimKey = null;
 let g_claimRefreshInterval = null;
+
+// Report-collapsing identity for the current test (see g_lastReportKey below
+// for why this can't just be re-derived from this.currentTest in afterEach).
+let g_currentReportKey = null;
 
 // runners_active bookkeeping. Every runner INCRs at globalSetup and DECRs
 // exactly once at teardown or on SIGTERM/SIGINT. The flag guards against
@@ -144,7 +149,7 @@ const g_retryErrors = new Map();
 //   - Also carries serial-group membership so afterEach knows when to mark
 //     the group as done in the shared done_tests set (last-in-group only).
 //
-// TestKeyInfo = { key, isSerial, serialGroupId, isLastInSerialGroup }
+// TestKeyInfo = { key, isSerial, serialGroupId, isLastInSerialGroup, reportKey }
 const g_testKeyInfo = new WeakMap();
 // Full set of distinct claim keys from this runner's local pre-walk.
 // Prepopulated into test_universe at mochaGlobalSetup (see
@@ -159,6 +164,10 @@ let g_localTestKeys = new Set();
 // pattern, but we degrade gracefully instead of throwing).
 const g_duplicateTestKeyFullPathCount = new Map();
 let g_lastTestKeyFullPath = null;
+// Same fallback treatment, but for the report-collapsing identity (see
+// reportKey in computeTestKeys / TestKeyInfo above).
+const g_reportKeyDupFallbackCount = new Map();
+let g_lastReportKey = null;
 
 // -----------------------------------------------------------------------------
 // getTestPath
@@ -302,6 +311,13 @@ async function publishTestUniverse() {
 function computeTestKeys(rootSuite) {
   const dupCount = new Map();               // base key -> count seen so far
   const serialGroupMembers = new Map();     // serial key -> [Test, ...]
+  // Report-collapsing identity: a dup-counter over the RAW joined path,
+  // computed BEFORE any serial collapsing. Independent of `dupCount` above
+  // (which is scoped to the post-collapse claim `key` and untouched for
+  // serial tests) so that distinct tests sharing one serial group's claim
+  // key still get distinct report identities instead of overwriting the
+  // same `{execId}:report` hash field.
+  const reportDupCount = new Map();
 
   g_localTestKeys.clear();
   g_localIndividualTestCount = 0;
@@ -311,6 +327,10 @@ function computeTestKeys(rootSuite) {
     const joined = path.join(":");
     const isSerial = joined.indexOf(SERIAL_PREFIX) !== -1;
     let key = buildTestKeyFromPath(path);
+
+    const rn = (reportDupCount.get(joined) || 0) + 1;
+    reportDupCount.set(joined, rn);
+    const reportKey = `${joined}:dup-${rn}`;
 
     if (!isSerial) {
       const n = (dupCount.get(key) || 0) + 1;
@@ -327,6 +347,7 @@ function computeTestKeys(rootSuite) {
       isSerial,
       serialGroupId: isSerial ? key : null,
       isLastInSerialGroup: false,
+      reportKey,
     });
   });
 
@@ -473,6 +494,7 @@ async function handleRescueCap(testKey, currentTest, attempts) {
   const resultKey = redisKeys.testResult();
   const countKey  = redisKeys.failedCount();
   const doneKey   = redisKeys.doneTests();
+  const reportRedisKey = redisKeys.report();
 
   const now = Date.now();
   const errObj = {
@@ -480,9 +502,26 @@ async function handleRescueCap(testKey, currentTest, attempts) {
              `likely crashes its runner. See MOCHA_DISTRIBUTED_MAX_RESCUES_PER_TEST.`,
   };
 
+  // Report identity per affected test (NOT the shared serial-group testKey —
+  // see computeTestKeys/reportKey). Reads must happen before the multi()
+  // below is built, same reasoning as afterEach. Kept as a defensive HGET
+  // (not skipped) since a real earlier attempt could have completed and
+  // written a report entry before a later attempt crashed its runner.
+  const reportEntries = [];
+  for (const t of affected) {
+    const tInfo = g_testKeyInfo.get(t);
+    const tReportKey = tInfo ? tInfo.reportKey : getTestPathFromTest(t).join(':');
+    let existing = null;
+    try {
+      const raw = await g_redis.hGet(reportRedisKey, tReportKey);
+      existing = raw ? JSON.parse(raw) : null;
+    } catch (_) { /* best-effort */ }
+    reportEntries.push({ t, tReportKey, existing });
+  }
+
   try {
     let pipe = g_redis.multi();
-    for (const t of affected) {
+    for (const { t, tReportKey, existing } of reportEntries) {
       const row = {
         id: getTestPathFromTest(t),
         type: t.type || 'test',
@@ -500,14 +539,45 @@ async function handleRescueCap(testKey, currentTest, attempts) {
         stdout: '',
         stderr: '',
         syntheticOrphan: true,
+        reportKey: tReportKey,
+      };
+      const syntheticAttempt = {
+        retryAttempt: attempts,
+        duration: 0,
+        state: 'failed',
+        timedOut: false,
+        err: errObj,
+        stdout: '',
+        stderr: '',
+      };
+      const reportRow = {
+        reportKey: tReportKey,
+        id: getTestPathFromTest(t),
+        type: t.type || 'test',
+        title: t.title,
+        timedOut: false,
+        duration: 0,
+        startTime: existing ? existing.startTime : now,
+        endTime: now,
+        retryTotal: attempts,
+        file: t.file,
+        state: 'failed',
+        failed: true,
+        err: errObj,
+        stdout: '',
+        stderr: '',
+        syntheticOrphan: true,
+        attempts: existing ? [...existing.attempts, syntheticAttempt] : [syntheticAttempt],
       };
       pipe = pipe
         .rPush(resultKey, JSON.stringify(row))
-        .incr(countKey);
+        .incr(countKey)
+        .hSet(reportRedisKey, tReportKey, JSON.stringify(reportRow));
     }
     pipe = pipe
       .expire(resultKey, g_expirationTimeSec)
       .expire(countKey,  g_expirationTimeSec)
+      .expire(reportRedisKey, g_expirationTimeSec)
       .sAdd(doneKey, testKey)
       .expire(doneKey, g_expirationTimeSec);
     await pipe.exec();
@@ -1080,6 +1150,26 @@ exports.mochaHooks = {
     let testKeySuite;
     let isSerial;
 
+    // Report-collapsing identity (see g_lastReportKey / g_currentReportKey):
+    // derived the same way and with the same retry-clone caveat as
+    // testKeyFullPath below, but kept in its own variable/cache since it
+    // must NOT collapse serial-group siblings the way testKeyFullPath does
+    // (see computeTestKeys — reportKey is built from the raw, uncollapsed
+    // path). Computed unconditionally, including for serial tests.
+    let reportKey;
+    if (preInfo) {
+      reportKey = preInfo.reportKey;
+      g_lastReportKey = reportKey;
+    } else if ((this.currentTest._currentRetry || 0) === 0) {
+      const rawPath = getTestPath(this.currentTest).join(":");
+      const rn = (g_reportKeyDupFallbackCount.get(rawPath) || 0) + 1;
+      g_reportKeyDupFallbackCount.set(rawPath, rn);
+      reportKey = `${rawPath}:dup-${rn}`;
+      g_lastReportKey = reportKey;
+    } else {
+      reportKey = g_lastReportKey;
+    }
+
     if (preInfo) {
       testKeyFullPath = preInfo.key;
       isSerial = preInfo.isSerial;
@@ -1160,6 +1250,7 @@ exports.mochaHooks = {
       this.skip();
     } else {
       g_currentClaimKey = testKey;
+      g_currentReportKey = reportKey;
       // Refresh well inside mocha's per-test timeout so a slow test never
       // lets its claim TTL expire while we're still running it.
       const refreshSecs = Math.max(
@@ -1243,6 +1334,11 @@ exports.mochaHooks = {
         err: errObj,
         stdout: capturedStdout,
         stderr: capturedStderr,
+        // The collapsed report identity for this test (see g_currentReportKey /
+        // computeTestKeys) — lets a consumer of this row go straight to
+        // HGET {execId}:report <reportKey> without recomputing the :dup-N
+        // suffix itself, which is only derivable by replaying the suite walk.
+        reportKey: g_currentReportKey,
       };
 
       // save results as single line on purpose
@@ -1269,12 +1365,70 @@ exports.mochaHooks = {
       }
       const doneKey = redisKeys.doneTests();
 
+      // Collapsed per-test report: one hash field per logical test, merging
+      // this attempt into any prior attempts recorded under the same
+      // report-collapsing identity (g_currentReportKey — NOT the claim key,
+      // which serial-group siblings share; see computeTestKeys). Must be
+      // read before the multi() below is built: a transaction can't branch
+      // on a value read mid-MULTI. Safe without a WATCH — mocha's retry
+      // loop is sequential within one process, and cross-runner exclusivity
+      // for a given test is already guaranteed by the claim CAS.
+      const reportRedisKey = redisKeys.report();
+      let existingReport = null;
+      if (g_currentReportKey) {
+        try {
+          const raw = await g_redis.hGet(reportRedisKey, g_currentReportKey);
+          existingReport = raw ? JSON.parse(raw) : null;
+        } catch (_) { /* best-effort; treat as no prior entry */ }
+      }
+
+      const perAttempt = {
+        retryAttempt,
+        duration: this.currentTest.duration,
+        state: stateFixed,
+        timedOut: this.currentTest.timedOut,
+        err: errObj,
+        stdout: capturedStdout,
+        stderr: capturedStderr,
+      };
+
+      const reportRow = g_currentReportKey ? {
+        reportKey: g_currentReportKey,
+        id: getTestPath(this.currentTest),
+        type: this.currentTest.type,
+        title: this.currentTest.title,
+        timedOut: this.currentTest.timedOut,
+        duration: this.currentTest.duration,
+        // Reuse testResult's own timestamps rather than calling Date.now()
+        // again — the intervening `await hGet` above means a fresh call
+        // here could drift from testResult.endTime by however long that
+        // read took.
+        startTime: existingReport ? existingReport.startTime : testResult.startTime,
+        endTime: testResult.endTime,
+        retryTotal,
+        file: this.currentTest.file,
+        state: stateFixed,
+        failed: stateFixed === FAILED,
+        speed: this.currentTest.speed,
+        err: errObj,
+        stdout: capturedStdout,
+        stderr: capturedStderr,
+        attempts: existingReport
+          ? [...existingReport.attempts, perAttempt]
+          : [perAttempt],
+      } : null;
+
       let pipe = g_redis
         .multi()
         .rPush(resultKey, JSON.stringify(testResult))
         .expire(resultKey, g_expirationTimeSec)
         .incr(countKey)
         .expire(countKey, g_expirationTimeSec);
+      if (reportRow) {
+        pipe = pipe
+          .hSet(reportRedisKey, g_currentReportKey, JSON.stringify(reportRow))
+          .expire(reportRedisKey, g_expirationTimeSec);
+      }
       if (shouldMarkDone && g_currentClaimKey) {
         pipe = pipe
           .sAdd(doneKey, g_currentClaimKey)
@@ -1296,6 +1450,7 @@ exports.mochaHooks = {
       } catch (_) {}
       g_currentClaimKey = null;
     }
+    g_currentReportKey = null;
   },
 };
 

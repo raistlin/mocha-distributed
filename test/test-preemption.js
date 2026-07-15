@@ -94,6 +94,14 @@ function makeMockClient(opts = {}) {
       if (preemptedKeys.has(k)) return 0;
       return kv.has(k) ? 1 : 0;
     },
+    // Hash primitive backing the collapsed `report` key. Stored as a JSON
+    // object under the hash's own kv entry, mirroring the sAdd/sMembers
+    // JSON-in-kv convention already used above for sets.
+    hGet:    async (k, field) => {
+      calls.push(['hGet', k, field]);
+      const obj = kv.has(k) ? JSON.parse(kv.get(k)) : {};
+      return Object.prototype.hasOwnProperty.call(obj, field) ? obj[field] : null;
+    },
     multi:   () => {
       const cmds = [];
       const chain = {
@@ -104,6 +112,7 @@ function makeMockClient(opts = {}) {
         incr:   (...a) => { cmds.push(['incr',   ...a]); return chain; },
         sAdd:   (...a) => { cmds.push(['sAdd',   ...a]); return chain; },
         exists: (...a) => { cmds.push(['exists', ...a]); return chain; },
+        hSet:   (...a) => { cmds.push(['hSet',   ...a]); return chain; },
         exec: async () => {
           calls.push(['multi', cmds.slice()]);
           // beforeEach pipeline: SET NX + GET (+ sAdd/expire on universe).
@@ -144,6 +153,12 @@ function makeMockClient(opts = {}) {
               results.push(members.flat().length);
             } else if (cmd[0] === 'exists') {
               results.push(kv.has(cmd[1]) ? 1 : 0);
+            } else if (cmd[0] === 'hSet') {
+              const [, hk, field, value] = cmd;
+              const obj = kv.has(hk) ? JSON.parse(kv.get(hk)) : {};
+              obj[field] = value;
+              kv.set(hk, JSON.stringify(obj));
+              results.push(1);
             } else {
               results.push(1);
             }
@@ -566,6 +581,59 @@ describe('mocha-distributed preemption resilience', function () {
       assert.deepStrictEqual(setKeys.slice(3, 6),
         [serialKey, serialKey, serialKey],
         'serial-group tests share one collapsed claim key');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  describe('collapsed report entries for serial-group siblings', function () {
+    // Serial-group members share ONE collapsed claim key (proven above), but
+    // each is a distinct logical test. `report` must key on something other
+    // than the claim key, or every sibling but the last would silently
+    // overwrite its group-mates' entry.
+    let client, lib;
+
+    before(function () {
+      client = makeMockClient();
+      injectMockRedis(client);
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'report-serial-exec';
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-report-serial';
+      delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
+      delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
+      lib = loadFreshLib();
+    });
+
+    after(function () { restoreRedis(); clearLib(); });
+
+    it('gives each serial-group sibling its own report entry instead of collapsing them together', async function () {
+      this.timeout(10000);
+
+      const m = new Mocha({ reporter: 'min' });
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+
+      const suite = Suite.create(m.suite, 'serial-report-suite');
+      suite.addTest(new Test('serial-a [serial-report-group]', function () {}));
+      suite.addTest(new Test('serial-b [serial-report-group]', function () {}));
+      suite.addTest(new Test('serial-c [serial-report-group]', function () {}));
+
+      await new Promise(resolve => m.run(resolve));
+
+      const execId = 'report-serial-exec';
+      const reportHashRaw = client.kv.get(`${execId}:report`);
+      assert.ok(reportHashRaw, 'report hash exists');
+      const reportHash = JSON.parse(reportHashRaw);
+
+      assert.strictEqual(Object.keys(reportHash).length, 3,
+        'three distinct report entries, one per serial-group sibling');
+
+      const titles = Object.values(reportHash).map(v => JSON.parse(v).title).sort();
+      assert.deepStrictEqual(titles, [
+        'serial-a [serial-report-group]',
+        'serial-b [serial-report-group]',
+        'serial-c [serial-report-group]',
+      ], 'each sibling kept its own title — none overwrote another');
     });
   });
 
@@ -1073,6 +1141,25 @@ describe('mocha-distributed preemption resilience', function () {
       assert.strictEqual(synthetic.failed, true);
       assert.ok(synthetic.err && /rescue attempts/i.test(synthetic.err.message),
         'synthetic err.message describes the exhausted rescue budget');
+
+      // The collapsed report hash must also get a synthetic entry, keyed by
+      // the test's own report identity (not the shared serial/claim key).
+      const reportHSets = client2.calls.filter(c => c[0] === 'multi')
+        .flatMap(c => c[1])
+        .filter(cmd => cmd[0] === 'hSet' && cmd[1] === `${execId2}:report`)
+        .map(cmd => ({ field: cmd[2], row: JSON.parse(cmd[3]) }));
+      assert.strictEqual(reportHSets.length, 1, 'one report hSet for the exhausted test');
+      const reportRow = reportHSets[0].row;
+      assert.strictEqual(reportRow.syntheticOrphan, true);
+      assert.strictEqual(reportRow.state, 'failed');
+      assert.strictEqual(reportRow.attempts.length, 1, 'one synthetic attempt recorded');
+      assert.strictEqual(reportRow.attempts[0].retryAttempt, 3, 'attempts = cap+1 that tripped the handler');
+
+      // The synthetic test_result row must also carry the matching
+      // reportKey, same as the normal (non-synthetic) write path.
+      assert.strictEqual(synthetic.reportKey, reportHSets[0].field,
+        'synthetic test_result row.reportKey resolves to the report hash field');
+      assert.strictEqual(reportRow.reportKey, reportHSets[0].field);
 
       // done_tests contains the key so drain can converge.
       const doneSet = JSON.parse(client2.kv.get(`${execId2}:done_tests`) || '[]');

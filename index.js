@@ -168,6 +168,14 @@ let g_lastTestKeyFullPath = null;
 // reportKey in computeTestKeys / TestKeyInfo above).
 const g_reportKeyDupFallbackCount = new Map();
 let g_lastReportKey = null;
+// Mirrors g_lastTestKeyFullPath, but caches the serial-group membership info
+// (isSerial / isLastInSerialGroup) from the last attempt where preInfo was
+// available. On a retry, mocha clones the Test (Runnable.retriedTest), so
+// afterEach's g_testKeyInfo.get(this.currentTest) misses — without this
+// cache there's no identity-independent way to tell whether the clone is
+// the last test in its serial group, and afterEach must fall back to never
+// marking serial retries done (see afterEach's shouldMarkDone fallback).
+let g_lastTestKeyMeta = null;
 
 // -----------------------------------------------------------------------------
 // getTestPath
@@ -1183,6 +1191,13 @@ exports.mochaHooks = {
       // fallback below reads g_lastTestKeyFullPath — it must reflect the
       // key we assigned to the original attempt of this same test.
       g_lastTestKeyFullPath = testKeyFullPath;
+      // Same idea for afterEach's shouldMarkDone: cache this attempt's
+      // serial-group membership so a later retry clone (missing from
+      // g_testKeyInfo) can still tell whether it's the group's last test.
+      g_lastTestKeyMeta = {
+        isSerial: preInfo.isSerial,
+        isLastInSerialGroup: preInfo.isLastInSerialGroup,
+      };
     } else {
       const testPath = getTestPath(this.currentTest);
       // Reuse the same base-key builder the pre-walk uses (buildTestKeyFromPath)
@@ -1356,12 +1371,31 @@ exports.mochaHooks = {
       if (preInfoAE) {
         shouldMarkDone = !preInfoAE.isSerial || preInfoAE.isLastInSerialGroup;
       } else {
-        // Fallback for tests missing from the pre-walk: only mark non-serial
-        // tests. Under-marking is safer than over-marking here — a missing
-        // done entry causes an unnecessary rescue attempt (harmless, gated
-        // by SET NX), whereas a premature done entry could hide an orphan.
-        const livePath = getTestPath(this.currentTest).join(":");
-        shouldMarkDone = livePath.indexOf(SERIAL_PREFIX) === -1;
+        // this.currentTest is a retry clone (preInfoAE misses g_testKeyInfo,
+        // a WeakMap keyed by the pre-walk's original Test objects — mocha's
+        // retry clones a Test via Runnable.retriedTest for every retry
+        // attempt). g_lastTestKeyMeta was cached from this same test's
+        // original attempt in beforeEach and reflects its real serial-group
+        // membership, so prefer it over guessing from the live path.
+        //
+        // Without this, every serial-group test that needed a retry was
+        // silently never marked done: the fallback used to assume any
+        // serial-looking path was "not last in group" and skip done-marking
+        // unconditionally, which stalled the whole distributed run waiting
+        // on a test that had, in fact, already finished (see the drain-phase
+        // stall root-caused 2026-07-17, ticket GHNW referenced in git log).
+        if (g_lastTestKeyMeta) {
+          shouldMarkDone =
+            !g_lastTestKeyMeta.isSerial || g_lastTestKeyMeta.isLastInSerialGroup;
+        } else {
+          // Fallback for tests missing from the pre-walk AND with no cached
+          // meta (e.g. a dynamically-added test with no prior attempt).
+          // Under-marking is safer than over-marking here — a missing done
+          // entry causes an unnecessary rescue attempt (harmless, gated by
+          // SET NX), whereas a premature done entry could hide an orphan.
+          const livePath = getTestPath(this.currentTest).join(":");
+          shouldMarkDone = livePath.indexOf(SERIAL_PREFIX) === -1;
+        }
       }
       const doneKey = redisKeys.doneTests();
 

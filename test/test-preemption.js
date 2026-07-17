@@ -716,6 +716,51 @@ describe('mocha-distributed preemption resilience', function () {
         'done_tests receives the plain key and one entry for the whole serial group');
     });
 
+    it('still marks a serial group done when its last test needs a retry', async function () {
+      // Regression test for the 2026-07-17 staging stall (GHNW): mocha
+      // clones the Test object for every retry attempt (Runnable.retry),
+      // so afterEach's g_testKeyInfo.get(this.currentTest) misses on a
+      // retried attempt -- it's looking up the clone, not the original
+      // object the pre-walk registered. Before the fix, the fallback for
+      // that miss unconditionally treated any [serial-*] test as "not last
+      // in group" and skipped done-marking, so a serial group whose last
+      // test needed a retry NEVER reached done_tests -- the distributed run
+      // hung in the drain phase forever waiting on a test that had, in
+      // fact, already finished.
+      this.timeout(10000);
+
+      const m = new Mocha({ reporter: 'min' });
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+
+      const suite = Suite.create(m.suite, 'sets-suite-retry');
+      suite.retries(1);
+      suite.addTest(new Test('s1 [serial-retry-g]', function () {}));
+      let attempt = 0;
+      suite.addTest(new Test('s2 [serial-retry-g]', function () {
+        attempt++;
+        if (attempt === 1) throw new Error('fails on first attempt');
+      }));
+
+      await new Promise(resolve => m.run(resolve));
+
+      const execId = 'pre-exec-sets';
+      const doneKey = `${execId}:done_tests`;
+      const serialKey = `${execId}:[serial-retry-g]`;
+
+      const doneAdds = [];
+      for (const c of client.calls) {
+        if (c[0] !== 'multi' || (c[1][0] && c[1][0][0] === 'sAdd')) continue;
+        for (const cmd of c[1]) {
+          if (cmd[0] === 'sAdd' && cmd[1] === doneKey) doneAdds.push(cmd[2]);
+        }
+      }
+
+      assert.ok(doneAdds.includes(serialKey),
+        'done_tests must receive the serial-group key even though the last test in the group retried');
+    });
+
     it('prepopulates test_universe at globalSetup, before any beforeEach fires', async function () {
       this.timeout(10000);
 

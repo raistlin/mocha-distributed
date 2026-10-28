@@ -134,11 +134,17 @@ whether a test has already been executed or not by other of their peers.
     A test key in redis goes through three phases:
 
     1. **In-flight** — short TTL (`MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME`),
-       refreshed by a keepalive while the test runs.
+       refreshed by a keepalive while the test runs. A serial group's
+       shared key stays in-flight from its first test until its last one,
+       even while the runner executes unrelated tests in between (a group
+       may span several suites and files).
     2. **Released on SIGTERM** — DEL'd, so another runner can re-claim it.
+       Any serial group still held when the local iteration ends (its last
+       test never ran on this runner) is DEL'd the same way before drain.
     3. **Completed** — promoted to a tombstone with TTL
        `MOCHA_DISTRIBUTED_EXPIRATION_TIME` (7 d default), matching the
-       result-list lifetime.
+       result-list lifetime, and added to `done_tests`. A claimed test that
+       skips itself at runtime (`this.skip()`) also counts as completed.
 
     This makes the runner safe to use on preemptible / spot infrastructure.
 
@@ -192,7 +198,8 @@ whether a test has already been executed or not by other of their peers.
     attempt crashed its runner), it is declared broken: exactly one
     runner (CAS-guarded) writes a synthetic failed row for it to
     `test_result`, bumps `failed_count`, marks it done, and the drain
-    loop can finally converge.
+    loop can finally converge. A serial group counts as one rescue per
+    pick-up, however many tests it contains.
 
   - **MOCHA_DISTRIBUTED_EXPECTED_TOTAL_OVERRIDE** (unset by default)
 

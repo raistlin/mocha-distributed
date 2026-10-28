@@ -61,7 +61,7 @@ function makeMockClient(opts = {}) {
       kv.set(k, String(n));
       return n;
     },
-    del:     async (k) => { calls.push(['del', k]); return 1; },
+    del:     async (k) => { calls.push(['del', k]); kv.delete(k); return 1; },
     // Set primitives used by the drain phase. Backed by a per-set Map
     // inside kv (stored as JSON so it round-trips through the string API).
     sAdd:    async (k, ...members) => {
@@ -1229,6 +1229,209 @@ describe('mocha-distributed preemption resilience', function () {
         'exactly one synthetic row across repeated cap-hits (CAS holds)');
 
       lib2.__testing.setDrainPhase(false);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  describe('serial group claim is held from its first to its last test', function () {
+    // A serial group may span several suites and files (e.g. a Login and a
+    // Signup suite sharing [serial-playerDevices]), so its owner runs
+    // unrelated tests between the group's members. The claim must stay a
+    // short-TTL, keepalive-refreshed claim for that whole stretch: if it is
+    // tombstoned after the first member and the owner dies before the last
+    // one, the group is neither done nor claimable and drain stalls until
+    // its timeout (staging stall, 2026-10-28).
+    let origOn;
+
+    function newMocha(lib) {
+      const m = new Mocha({ reporter: 'min' });
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+      return m;
+    }
+
+    function doneMembers(client, execId) {
+      return JSON.parse(client.kv.get(`${execId}:done_tests`) || '[]');
+    }
+
+    beforeEach(function () {
+      // Teardown queues a process.on('exit') verdict handler; keep it out
+      // of the outer test process.
+      origOn = process.on.bind(process);
+      process.on = function (event, handler) {
+        if (event === 'exit') return process;
+        return origOn(event, handler);
+      };
+      process.env.MOCHA_DISTRIBUTED = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_POLL_INTERVAL = '1';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_TIMEOUT       = '3';
+      delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
+      delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
+    });
+
+    afterEach(function () {
+      process.on = origOn;
+      delete process.env.MOCHA_DISTRIBUTED_MAX_RESCUES_PER_TEST;
+      restoreRedis();
+      clearLib();
+    });
+
+    it('keeps the group claim short-lived and refreshed while unrelated tests run in between', async function () {
+      this.timeout(10000);
+      const execId = 'pre-exec-hold';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = execId;
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-hold';
+      const client = makeMockClient();
+      injectMockRedis(client);
+
+      const realSetInterval = global.setInterval;
+      const intervals = [];
+      global.setInterval = function (fn, ms) {
+        intervals.push(fn);
+        return realSetInterval(() => {}, 1 << 30);
+      };
+
+      const groupKey = `${execId}:[serial-g]`;
+      const isTombstone = (c) =>
+        c[0] === 'expire' && c[1] === groupKey && String(c[2]) === LONG_TTL;
+      let tombstonedMidGroup = null;
+      let refreshedMidGroup = null;
+
+      try {
+        const lib = loadFreshLib();
+        const m = newMocha(lib);
+        const login = Suite.create(m.suite, 'Login Suite [serial-g]');
+        login.addTest(new Test('l1', function () {}));
+        login.addTest(new Test('l2', function () {}));
+        const other = Suite.create(m.suite, 'Other Suite');
+        other.addTest(new Test('o1', async function () {
+          tombstonedMidGroup = client.calls.some(isTombstone);
+          const callsBefore = client.calls.length;
+          for (const fn of intervals) fn();
+          await new Promise(r => setImmediate(r));
+          refreshedMidGroup = client.calls.slice(callsBefore).some(c =>
+            c[0] === 'expire' && c[1] === groupKey && String(c[2]) === SHORT_TTL);
+        }));
+        const signup = Suite.create(m.suite, 'Signup Suite [serial-g]');
+        signup.addTest(new Test('s1', function () {}));
+
+        await new Promise(resolve => m.run(resolve));
+      } finally {
+        global.setInterval = realSetInterval;
+      }
+
+      assert.strictEqual(tombstonedMidGroup, false,
+        'group claim is not tombstoned before its last test runs');
+      assert.strictEqual(refreshedMidGroup, true,
+        'group claim keepalive keeps refreshing while an unrelated test runs');
+      assert.strictEqual(client.calls.filter(isTombstone).length, 1,
+        'group claim is tombstoned once, after its last test');
+      assert.ok(doneMembers(client, execId).includes(groupKey),
+        'group is marked done after its last test');
+    });
+
+    it('lets drain rescue a group whose owner never reached its last test, as one rescue', async function () {
+      this.timeout(15000);
+      const execId = 'pre-exec-hold-rescue';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = execId;
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-hold-rescue';
+      // Fewer than the group's 3 members: counting a rescue per member
+      // would trip the cap and write synthetic failures.
+      process.env.MOCHA_DISTRIBUTED_MAX_RESCUES_PER_TEST = '2';
+      const client = makeMockClient();
+      injectMockRedis(client);
+      const lib = loadFreshLib();
+
+      const m = newMocha(lib);
+      const login = Suite.create(m.suite, 'Login Suite [serial-g]');
+      login.addTest(new Test('l1', function () {}));
+      login.addTest(new Test('l2', function () {}));
+      // The group's last test never runs in Phase A (its suite hook fails
+      // once), standing in for an owner that dies mid-group.
+      const signup = Suite.create(m.suite, 'Signup Suite [serial-g]');
+      let hookCalls = 0;
+      signup.beforeAll(function () {
+        hookCalls++;
+        if (hookCalls === 1) throw new Error('owner lost mid-group');
+      });
+      let s1Runs = 0;
+      signup.addTest(new Test('s1', function () { s1Runs++; }));
+
+      const startedAt = Date.now();
+      await new Promise(resolve => m.run(resolve));
+      const elapsed = Date.now() - startedAt;
+
+      const groupKey = `${execId}:[serial-g]`;
+      assert.ok(doneMembers(client, execId).includes(groupKey),
+        'drain re-ran the group and marked it done');
+      assert.strictEqual(s1Runs, 1, 'the group\'s last test ran during drain');
+      assert.ok(elapsed < 3000, `drain completed before its timeout (elapsed ${elapsed}ms)`);
+
+      const synthetic = client.calls.filter(c => c[0] === 'multi')
+        .flatMap(c => c[1])
+        .filter(cmd => cmd[0] === 'rPush' && cmd[1] === `${execId}:test_result`)
+        .filter(cmd => JSON.parse(cmd[2]).syntheticOrphan === true);
+      assert.strictEqual(synthetic.length, 0,
+        'rescuing a group counts once, not once per member');
+    });
+
+    it('marks a claimed test done when it skips itself at runtime', async function () {
+      this.timeout(10000);
+      const execId = 'pre-exec-self-skip';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = execId;
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-self-skip';
+      const client = makeMockClient();
+      injectMockRedis(client);
+      const lib = loadFreshLib();
+
+      const m = newMocha(lib);
+      const suite = Suite.create(m.suite, 'skip-suite');
+      suite.addTest(new Test('self-skip', function () { this.skip(); }));
+
+      const startedAt = Date.now();
+      await new Promise(resolve => m.run(resolve));
+      const elapsed = Date.now() - startedAt;
+
+      assert.ok(doneMembers(client, execId).includes(`${execId}:skip-suite:self-skip:dup-1`),
+        'a self-skipped test is accounted for in done_tests');
+      assert.ok(elapsed < 3000, `drain completed before its timeout (elapsed ${elapsed}ms)`);
+    });
+
+    it('SIGTERM DELs a held group claim, not just the in-flight test\'s', async function () {
+      this.timeout(10000);
+      const execId = 'pre-exec-hold-sigterm';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = execId;
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-hold-sigterm';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_ENABLED = 'false';
+      const client = makeMockClient();
+      injectMockRedis(client);
+      const realExit = process.exit;
+      process.exit = function () { /* no-op for tests */ };
+
+      try {
+        const lib = loadFreshLib();
+        const m = newMocha(lib);
+        const login = Suite.create(m.suite, 'Login Suite [serial-g]');
+        login.addTest(new Test('l1', function () {}));
+        const other = Suite.create(m.suite, 'Other Suite');
+        other.addTest(new Test('o1', async function () {
+          const listeners = process.listeners('SIGTERM');
+          await listeners[listeners.length - 1]();
+        }));
+        const signup = Suite.create(m.suite, 'Signup Suite [serial-g]');
+        signup.addTest(new Test('s1', function () {}));
+
+        await new Promise(resolve => m.run(resolve));
+      } finally {
+        process.exit = realExit;
+      }
+
+      const deleted = client.calls.filter(c => c[0] === 'del').map(c => c[1]);
+      assert.ok(deleted.includes(`${execId}:[serial-g]`),
+        'SIGTERM DELs the held serial group claim');
+      assert.ok(deleted.includes(`${execId}:Other Suite:o1:dup-1`),
+        'SIGTERM still DELs the in-flight test claim');
     });
   });
 

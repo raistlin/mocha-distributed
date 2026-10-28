@@ -6,6 +6,7 @@
 const redis = require("redis");
 const crypto = require("crypto");
 const Mocha = require("mocha");
+const { createClaimHolder } = require("./lib/claim-holder");
 
 const SERIAL_PREFIX = "[serial";
 
@@ -68,10 +69,18 @@ let g_redis = null;
 
 let g_capture = { stdout: null, stderr: null };
 
-// Track the in-flight claim so we can keepalive-refresh it, tombstone it
-// after completion, and DEL it on SIGTERM.
+// Track the in-flight claim so afterEach can tombstone it once complete.
 let g_currentClaimKey = null;
-let g_claimRefreshInterval = null;
+
+// Keepalive for every claim this runner holds: a plain test's while it runs,
+// a serial group's from its first test until its last one (the group may
+// span suites and files, so unrelated tests run in between). Refreshed well
+// inside the claim TTL; held claims are DEL'd on SIGTERM and released before
+// drain so a peer can rescue them. See lib/claim-holder.js.
+const g_claimHolder = createClaimHolder({
+  refresh: (key) => g_redis.expire(key, g_claimExpirationTimeSec).catch(() => {}),
+  intervalMs: Math.max(30, Math.floor(g_claimExpirationTimeSec / 3)) * 1000,
+});
 
 // Report-collapsing identity for the current test (see g_lastReportKey below
 // for why this can't just be re-derived from this.currentTest in afterEach).
@@ -175,7 +184,7 @@ let g_lastReportKey = null;
 // afterEach's g_testKeyInfo.get(this.currentTest) misses — without this
 // cache there's no identity-independent way to tell whether the clone is
 // the last test in its serial group, and afterEach must fall back to never
-// marking serial retries done (see afterEach's shouldMarkDone fallback).
+// marking serial retries done (see isClaimComplete's fallback).
 let g_lastTestKeyMeta = null;
 
 // -----------------------------------------------------------------------------
@@ -845,6 +854,10 @@ async function runDrainIteration(orphanKeys) {
       hook.fn = hook.__mdOriginalFn;
       delete hook.__mdOriginalFn;
     }
+    // A rescued serial group that didn't reach its last test would keep a
+    // refreshed claim and never be retried; release it for the next
+    // iteration (bounded by the rescue budget).
+    await releaseHeldClaims();
   }
 }
 
@@ -1093,6 +1106,10 @@ exports.mochaGlobalTeardown = async function () {
     // rationale. Users can disable this with MOCHA_DISTRIBUTED_DRAIN_ENABLED
     // if they need the old "exit as soon as local iteration finishes"
     // behaviour — they should not, on preemptible infra.
+    // Serial groups whose last test never ran here would otherwise keep a
+    // refreshed claim forever and never surface as drain orphans.
+    await releaseHeldClaims();
+
     let drainResult = null;
     if (g_drainEnabled) {
       try { drainResult = await runDrainLoop(); } catch (err) {
@@ -1149,6 +1166,64 @@ exports.mochaGlobalTeardown = async function () {
     }
   }
 };
+
+// -----------------------------------------------------------------------------
+// isClaimComplete
+//
+// Whether finishing `test` completes its claim, i.e. its claim key can be
+// marked done and tombstoned. Serial groups share one claim key and are
+// semantically "done" only when the last test in the group finishes;
+// completing earlier would let a drain-phase peer conclude the group is
+// complete while later tests still have to run if the owner gets preempted
+// mid-group.
+// -----------------------------------------------------------------------------
+function isClaimComplete(test) {
+  const info = g_testKeyInfo.get(test);
+  if (info) return !info.isSerial || info.isLastInSerialGroup;
+
+  // `test` is a retry clone (it misses g_testKeyInfo, a WeakMap keyed by the
+  // pre-walk's original Test objects — mocha's retry clones a Test via
+  // Runnable.retriedTest for every retry attempt). g_lastTestKeyMeta was
+  // cached from this same test's original attempt in beforeEach and reflects
+  // its real serial-group membership, so prefer it over guessing from the
+  // live path.
+  //
+  // Without this, every serial-group test that needed a retry was silently
+  // never marked done: the fallback used to assume any serial-looking path
+  // was "not last in group" and skip done-marking unconditionally, which
+  // stalled the whole distributed run waiting on a test that had, in fact,
+  // already finished (see the drain-phase stall root-caused 2026-07-17,
+  // ticket GHNW referenced in git log).
+  if (g_lastTestKeyMeta) {
+    return !g_lastTestKeyMeta.isSerial || g_lastTestKeyMeta.isLastInSerialGroup;
+  }
+
+  // Fallback for tests missing from the pre-walk AND with no cached meta
+  // (e.g. a dynamically-added test with no prior attempt). Under-marking is
+  // safer than over-marking here — a missing done entry causes an
+  // unnecessary rescue attempt (harmless, gated by SET NX), whereas a
+  // premature done entry could hide an orphan.
+  return getTestPath(test).join(":").indexOf(SERIAL_PREFIX) === -1;
+}
+
+// -----------------------------------------------------------------------------
+// releaseHeldClaims
+//
+// Stop refreshing every claim this runner holds and DEL the ones it still
+// owns, so a peer or the drain phase can claim them again. Outside SIGTERM,
+// anything still held here is a serial group whose last test never ran on
+// this runner (e.g. its suite's before-all hook failed).
+// -----------------------------------------------------------------------------
+async function releaseHeldClaims() {
+  for (const key of g_claimHolder.releaseAll()) {
+    try {
+      if (await g_redis.get(key) === g_runnerId) {
+        await g_redis.del(key);
+        console.log(`[mocha-distributed] released unfinished claim "${key}"`);
+      }
+    } catch (_) { /* best-effort; the claim TTL expires on its own */ }
+  }
+}
 
 // -----------------------------------------------------------------------------
 // Hook tests
@@ -1215,7 +1290,7 @@ exports.mochaHooks = {
       // fallback below reads g_lastTestKeyFullPath — it must reflect the
       // key we assigned to the original attempt of this same test.
       g_lastTestKeyFullPath = testKeyFullPath;
-      // Same idea for afterEach's shouldMarkDone: cache this attempt's
+      // Same idea for isClaimComplete: cache this attempt's
       // serial-group membership so a later retry clone (missing from
       // g_testKeyInfo) can still tell whether it's the group's last test.
       g_lastTestKeyMeta = {
@@ -1253,8 +1328,10 @@ exports.mochaHooks = {
     // Drain-phase rescue budget: if this runner is in drain (not the
     // initial iteration), bump the per-test counter and check the cap
     // before attempting to claim. On cap exhaustion, write a synthetic
-    // failure row via the CAS-guarded handler and skip.
-    if (g_drainPhase) {
+    // failure row via the CAS-guarded handler and skip. A serial group is
+    // one rescue: later members of a group this runner already holds don't
+    // count again.
+    if (g_drainPhase && !g_claimHolder.isHeld(testKey)) {
       try {
         const rcKey = redisKeys.rescueCount(testKey);
         const attempts = await g_redis.incr(rcKey);
@@ -1290,15 +1367,10 @@ exports.mochaHooks = {
     } else {
       g_currentClaimKey = testKey;
       g_currentReportKey = reportKey;
-      // Refresh well inside mocha's per-test timeout so a slow test never
-      // lets its claim TTL expire while we're still running it.
-      const refreshSecs = Math.max(
-        30,
-        Math.floor(Number(g_claimExpirationTime) / 3)
-      );
-      g_claimRefreshInterval = setInterval(() => {
-        g_redis.expire(testKey, g_claimExpirationTimeSec).catch(() => {});
-      }, refreshSecs * 1000);
+      // Keep the claim alive so a slow test (or a serial group running
+      // unrelated tests between its members) never lets its TTL expire
+      // while we still own it. Idempotent for a group already held.
+      g_claimHolder.hold(testKey);
       g_capture.stdout = captureStream(process.stdout);
       g_capture.stderr = captureStream(process.stderr);
     }
@@ -1308,6 +1380,7 @@ exports.mochaHooks = {
     const SKIPPED = "pending";
     const FAILED = "failed";
     const PASSED = "passed";
+    const claimComplete = isClaimComplete(this.currentTest);
 
     let capturedStdout = "";
     let capturedStderr = "";
@@ -1384,43 +1457,6 @@ exports.mochaHooks = {
       const resultKey = `${g_testExecutionId}:test_result`;
       const countKey = `${g_testExecutionId}:${stateFixed}_count`;
 
-      // Mark this test key as done in the shared set, so the drain phase
-      // can tell it has been accounted for. Serial groups share one claim
-      // key and are semantically "done" only when the last test in the
-      // group finishes; marking done earlier would let a drain-phase peer
-      // conclude the group is complete while later tests still have to run
-      // if the owner gets preempted mid-group.
-      const preInfoAE = g_testKeyInfo.get(this.currentTest);
-      let shouldMarkDone;
-      if (preInfoAE) {
-        shouldMarkDone = !preInfoAE.isSerial || preInfoAE.isLastInSerialGroup;
-      } else {
-        // this.currentTest is a retry clone (preInfoAE misses g_testKeyInfo,
-        // a WeakMap keyed by the pre-walk's original Test objects — mocha's
-        // retry clones a Test via Runnable.retriedTest for every retry
-        // attempt). g_lastTestKeyMeta was cached from this same test's
-        // original attempt in beforeEach and reflects its real serial-group
-        // membership, so prefer it over guessing from the live path.
-        //
-        // Without this, every serial-group test that needed a retry was
-        // silently never marked done: the fallback used to assume any
-        // serial-looking path was "not last in group" and skip done-marking
-        // unconditionally, which stalled the whole distributed run waiting
-        // on a test that had, in fact, already finished (see the drain-phase
-        // stall root-caused 2026-07-17, ticket GHNW referenced in git log).
-        if (g_lastTestKeyMeta) {
-          shouldMarkDone =
-            !g_lastTestKeyMeta.isSerial || g_lastTestKeyMeta.isLastInSerialGroup;
-        } else {
-          // Fallback for tests missing from the pre-walk AND with no cached
-          // meta (e.g. a dynamically-added test with no prior attempt).
-          // Under-marking is safer than over-marking here — a missing done
-          // entry causes an unnecessary rescue attempt (harmless, gated by
-          // SET NX), whereas a premature done entry could hide an orphan.
-          const livePath = getTestPath(this.currentTest).join(":");
-          shouldMarkDone = livePath.indexOf(SERIAL_PREFIX) === -1;
-        }
-      }
       const doneKey = redisKeys.doneTests();
 
       // Collapsed per-test report: one hash field per logical test, merging
@@ -1487,27 +1523,36 @@ exports.mochaHooks = {
           .hSet(reportRedisKey, g_currentReportKey, JSON.stringify(reportRow))
           .expire(reportRedisKey, g_expirationTimeSec);
       }
-      if (shouldMarkDone && g_currentClaimKey) {
+      if (claimComplete && g_currentClaimKey) {
         pipe = pipe
           .sAdd(doneKey, g_currentClaimKey)
           .expire(doneKey, g_expirationTimeSec);
       }
       await pipe.exec();
+    } else if (claimComplete && g_currentClaimKey) {
+      // We claimed this test and it skipped itself at runtime (this.skip()
+      // in its body). That is still an outcome: account for it, or the
+      // tombstone below hides it from drain without it ever being done.
+      try {
+        await g_redis
+          .multi()
+          .sAdd(redisKeys.doneTests(), g_currentClaimKey)
+          .expire(redisKeys.doneTests(), g_expirationTimeSec)
+          .exec();
+      } catch (_) {}
     }
 
-    // Stop the keepalive and promote the claim key to a tombstone matching
-    // the result-list lifetime, so a replacement pod won't re-run a test
-    // that already produced a result.
-    if (g_claimRefreshInterval) {
-      clearInterval(g_claimRefreshInterval);
-      g_claimRefreshInterval = null;
-    }
-    if (g_currentClaimKey) {
+    // Once the claim is complete, stop its keepalive and promote it to a
+    // tombstone matching the result-list lifetime, so a replacement pod
+    // won't re-run a test that already produced a result. An unfinished
+    // serial group keeps its short, refreshed claim until its last test.
+    if (g_currentClaimKey && claimComplete) {
+      g_claimHolder.release(g_currentClaimKey);
       try {
         await g_redis.expire(g_currentClaimKey, g_expirationTimeSec);
       } catch (_) {}
-      g_currentClaimKey = null;
     }
+    g_currentClaimKey = null;
     g_currentReportKey = null;
   },
 };
@@ -1515,21 +1560,17 @@ exports.mochaHooks = {
 // -----------------------------------------------------------------------------
 // Graceful shutdown
 //
-// On SIGTERM (e.g. GKE spot preemption), release the in-flight claim so a
-// replacement pod can re-run the interrupted test. Without this the claim
-// would sit locked until g_claimExpirationTime, blocking recovery.
+// On SIGTERM (e.g. GKE spot preemption), release every held claim (the
+// in-flight test's and any unfinished serial group's) so a replacement pod
+// can re-run the interrupted tests. Without this the claims would sit locked
+// until g_claimExpirationTime, blocking recovery.
 // -----------------------------------------------------------------------------
 async function releaseClaimAndExit(signal) {
   try {
-    if (g_claimRefreshInterval) {
-      clearInterval(g_claimRefreshInterval);
-      g_claimRefreshInterval = null;
-    }
-    if (g_currentClaimKey && g_redis) {
-      const owner = await g_redis.get(g_currentClaimKey);
-      if (owner === g_runnerId) {
-        await g_redis.del(g_currentClaimKey);
-      }
+    if (g_redis) {
+      await releaseHeldClaims();
+    } else {
+      g_claimHolder.releaseAll();
     }
     // Decrement runners_active so peers see us leaving the pool. Guarded
     // against double-decrement by decrementRunnersActive itself.

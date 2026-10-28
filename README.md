@@ -191,6 +191,19 @@ whether a test has already been executed or not by other of their peers.
     A small (±20%) jitter is applied per iteration to prevent every
     runner from polling in lock-step.
 
+  - **MOCHA_DISTRIBUTED_HEARTBEAT_INTERVAL** = 30
+
+    Seconds between runner heartbeats. Every runner keeps its id in the
+    sorted set `{execId}:runners_heartbeat`, scored by its last check-in
+    time (ms since epoch), and removes itself on graceful exit or SIGTERM.
+    A runner counts as live while its last check-in is within three
+    intervals (90 s by default); a hard-killed runner (OOM, spot reclaim)
+    simply ages out. Count live runners with
+    `ZCOUNT {execId}:runners_heartbeat <now - 90000> +inf`; the drain
+    status line reports this figure. The older `{execId}:runners_active`
+    counter is still written, but only decrements on graceful exit, so it
+    overstates live runners whenever one is hard-killed.
+
   - **MOCHA_DISTRIBUTED_MAX_RESCUES_PER_TEST** = 3
 
     Per-test rescue budget. If a single test is picked up by the drain

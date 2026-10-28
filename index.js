@@ -7,6 +7,7 @@ const redis = require("redis");
 const crypto = require("crypto");
 const Mocha = require("mocha");
 const { createClaimHolder } = require("./lib/claim-holder");
+const { createRunnerHeartbeat, countLiveRunners } = require("./lib/runner-heartbeat");
 
 const SERIAL_PREFIX = "[serial";
 
@@ -45,6 +46,7 @@ const redisKeys = {
   expectedTotal: () => `${g_testExecutionId}:expected_total`,
   expectedTotalIndividual: () => `${g_testExecutionId}:expected_total_individual`,
   runnersActive: () => `${g_testExecutionId}:runners_active`,
+  runnersHeartbeat: () => `${g_testExecutionId}:runners_heartbeat`,
   capHitMarker: (testKey) => `${g_testExecutionId}:cap_hit_marker:${testKey}`,
   rescueCount: (testKey) => `${g_testExecutionId}:rescue_count:${testKey}`,
   testResult: () => `${g_testExecutionId}:test_result`,
@@ -90,6 +92,12 @@ let g_currentReportKey = null;
 // exactly once at teardown or on SIGTERM/SIGINT. The flag guards against
 // double-decrement when both paths could fire.
 let g_runnersActiveDecremented = false;
+
+// Live-runner heartbeat (see lib/runner-heartbeat.js), started at
+// globalSetup once redis is connected. Unlike runners_active it stays
+// accurate when a runner is hard-killed: the dead runner stops checking in
+// and ages out of the live window.
+let g_heartbeat = null;
 
 // Local test count derived from computeTestKeys. Used to publish
 // expected_total in redis via max-tracking, and later as a fast local
@@ -143,6 +151,15 @@ const g_drainPollIntervalSec = Math.max(
   1,
   parseInt(process.env.MOCHA_DISTRIBUTED_DRAIN_POLL_INTERVAL || "5", 10) || 5
 );
+
+// Runner heartbeat cadence. A runner counts as live while its last check-in
+// is within three intervals, so one or two missed beats (a slow redis, a
+// GC pause) don't drop it.
+const g_heartbeatIntervalSec = Math.max(
+  1,
+  parseInt(process.env.MOCHA_DISTRIBUTED_HEARTBEAT_INTERVAL || "30", 10) || 30
+);
+const g_liveRunnerWindowMs = 3 * g_heartbeatIntervalSec * 1000;
 
 // Cache errors from intermediate retry attempts. Mocha only sets test.err via
 // the reporter on the final EVENT_TEST_FAIL; for non-final retries it emits
@@ -711,11 +728,11 @@ async function getExpectedTotal() {
   } catch (_) { return 0; }
 }
 
-async function getRunnersActive() {
-  const key = redisKeys.runnersActive();
+async function getLiveRunners() {
   try {
-    const v = await g_redis.get(key);
-    return parseInt(v || "0", 10) || 0;
+    return await countLiveRunners(
+      g_redis, redisKeys.runnersHeartbeat(), g_liveRunnerWindowMs
+    );
   } catch (_) { return 0; }
 }
 
@@ -907,7 +924,7 @@ async function runDrainLoop() {
   const printStatus = async () => {
     try {
       const [done, expected, active] = await Promise.all([
-        getDoneCount(), getExpectedTotal(), getRunnersActive(),
+        getDoneCount(), getExpectedTotal(), getLiveRunners(),
       ]);
       const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
       const waiting = Math.max(0, expected - done);
@@ -1087,13 +1104,27 @@ exports.mochaGlobalSetup = async function () {
   //   - expected_total_individual : same max-tracking, but the raw
   //                       per-test walk count - diagnostic only, not read
   //                       by any coordination/drain logic.
-  //   - runners_active : live runner counter, INCR here / DECR at teardown.
-  // All five are best-effort -- failures shouldn't prevent tests from running.
+  //   - runners_active : runner counter, INCR here / DECR at graceful exit
+  //                       only, so hard-killed runners inflate it. Kept for
+  //                       consumers that predate runners_heartbeat.
+  //   - runners_heartbeat : runner id -> last check-in time, refreshed every
+  //                       g_heartbeatIntervalSec; count recent members for
+  //                       an accurate live-runner figure.
+  // All of these are best-effort -- failures shouldn't prevent tests from
+  // running.
   try { await publishRunStartedAt();    } catch (_) {}
   try { await publishTestUniverse();    } catch (_) {}
   try { await publishExpectedTotal();   } catch (_) {}
   try { await publishIndividualExpectedTotal(); } catch (_) {}
   try { await incrementRunnersActive(); } catch (_) {}
+  g_heartbeat = createRunnerHeartbeat({
+    redis: g_redis,
+    key: redisKeys.runnersHeartbeat(),
+    runnerId: g_runnerId,
+    intervalMs: g_heartbeatIntervalSec * 1000,
+    ttlSec: g_expirationTimeSec,
+  });
+  await g_heartbeat.start();
 };
 
 // -----------------------------------------------------------------------------
@@ -1130,6 +1161,7 @@ exports.mochaGlobalTeardown = async function () {
     // Best-effort DECR before we tear down the connection. Idempotent, so
     // if SIGTERM fired first this is a no-op.
     try { await decrementRunnersActive(); } catch (_) {}
+    if (g_heartbeat) await g_heartbeat.stop();
 
     // Compute the global exit-code verdict before quitting the client.
     // Contract (see docs/preemption-resilience-plan.md):
@@ -1577,6 +1609,8 @@ async function releaseClaimAndExit(signal) {
     if (g_redis) {
       try { await decrementRunnersActive(); } catch (_) {}
     }
+    // Leave the live-runner set right away instead of aging out.
+    if (g_heartbeat) await g_heartbeat.stop();
   } catch (_) {}
   try {
     if (g_redis) await g_redis.quit();

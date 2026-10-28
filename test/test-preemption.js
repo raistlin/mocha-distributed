@@ -94,6 +94,29 @@ function makeMockClient(opts = {}) {
       if (preemptedKeys.has(k)) return 0;
       return kv.has(k) ? 1 : 0;
     },
+    // Sorted-set primitives backing the runner heartbeat. Stored as a JSON
+    // object (member -> score) under the set's own kv entry, same
+    // JSON-in-kv convention as the sets above.
+    zAdd:    async (k, { score, value }) => {
+      calls.push(['zAdd', k, value, score]);
+      const obj = kv.has(k) ? JSON.parse(kv.get(k)) : {};
+      obj[value] = score;
+      kv.set(k, JSON.stringify(obj));
+      return 1;
+    },
+    zRem:    async (k, member) => {
+      calls.push(['zRem', k, member]);
+      const obj = kv.has(k) ? JSON.parse(kv.get(k)) : {};
+      const had = Object.prototype.hasOwnProperty.call(obj, member);
+      delete obj[member];
+      kv.set(k, JSON.stringify(obj));
+      return had ? 1 : 0;
+    },
+    zCount:  async (k, min /*, max */) => {
+      calls.push(['zCount', k, min]);
+      const obj = kv.has(k) ? JSON.parse(kv.get(k)) : {};
+      return Object.values(obj).filter(s => s >= Number(min)).length;
+    },
     // Hash primitive backing the collapsed `report` key. Stored as a JSON
     // object under the hash's own kv entry, mirroring the sAdd/sMembers
     // JSON-in-kv convention already used above for sets.
@@ -851,6 +874,102 @@ describe('mocha-distributed preemption resilience', function () {
       // Net value should be 0 after the run.
       assert.strictEqual(client.kv.get(`${execId}:runners_active`), '0',
         'runners_active net change is zero');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  describe('runner heartbeat', function () {
+    // runners_active only decrements on a graceful exit, so hard-killed pods
+    // inflate it forever. Each runner also keeps its id in
+    // `runners_heartbeat`, scored by its last check-in time: consumers count
+    // runners seen recently, and dead ones age out on their own.
+    let origOn;
+
+    function heartbeatMembers(client, execId) {
+      return Object.keys(JSON.parse(client.kv.get(`${execId}:runners_heartbeat`) || '{}'));
+    }
+
+    beforeEach(function () {
+      origOn = process.on.bind(process);
+      process.on = function (event, handler) {
+        if (event === 'exit') return process;
+        return origOn(event, handler);
+      };
+      process.env.MOCHA_DISTRIBUTED = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_POLL_INTERVAL = '1';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_TIMEOUT       = '3';
+      delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
+      delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
+    });
+
+    afterEach(function () {
+      process.on = origOn;
+      restoreRedis();
+      clearLib();
+    });
+
+    it('checks in at globalSetup and leaves the live set at teardown', async function () {
+      this.timeout(10000);
+      const execId = 'pre-exec-heartbeat';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = execId;
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-heartbeat';
+      const client = makeMockClient();
+      injectMockRedis(client);
+      const lib = loadFreshLib();
+
+      const m = new Mocha({ reporter: 'min' });
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+      let membersWhileRunning = null;
+      const suite = Suite.create(m.suite, 'heartbeat-suite');
+      suite.addTest(new Test('a', function () {
+        membersWhileRunning = heartbeatMembers(client, execId);
+      }));
+
+      await new Promise(resolve => m.run(resolve));
+
+      assert.deepStrictEqual(membersWhileRunning, ['runner-heartbeat'],
+        'runner is in the live set while its tests run');
+      assert.deepStrictEqual(heartbeatMembers(client, execId), [],
+        'runner left the live set on graceful teardown');
+    });
+
+    it('leaves the live set on SIGTERM', async function () {
+      this.timeout(10000);
+      const execId = 'pre-exec-heartbeat-sigterm';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = execId;
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-heartbeat-sigterm';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_ENABLED = 'false';
+      const client = makeMockClient();
+      injectMockRedis(client);
+      const realExit = process.exit;
+      process.exit = function () { /* no-op for tests */ };
+
+      let membersBeforeSigterm = null;
+      let membersAfterSigterm = null;
+      try {
+        const lib = loadFreshLib();
+        const m = new Mocha({ reporter: 'min' });
+        m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
+        m.globalSetup([lib.mochaGlobalSetup]);
+        const suite = Suite.create(m.suite, 'heartbeat-sigterm-suite');
+        suite.addTest(new Test('preempted', async function () {
+          membersBeforeSigterm = heartbeatMembers(client, execId);
+          const listeners = process.listeners('SIGTERM');
+          await listeners[listeners.length - 1]();
+          membersAfterSigterm = heartbeatMembers(client, execId);
+        }));
+
+        await new Promise(resolve => m.run(resolve));
+      } finally {
+        process.exit = realExit;
+      }
+
+      assert.deepStrictEqual(membersBeforeSigterm, ['runner-heartbeat-sigterm'],
+        'runner is in the live set before SIGTERM');
+      assert.deepStrictEqual(membersAfterSigterm, [],
+        'SIGTERM removes the runner from the live set');
     });
   });
 

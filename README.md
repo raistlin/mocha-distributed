@@ -117,12 +117,16 @@ whether a test has already been executed or not by other of their peers.
     once a test produces a result, its claim key is promoted to this TTL so
     a replacement runner won't re-run it.
 
-  - **MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME** = 600
+  - **MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME** = 180
 
     TTL (in seconds) for the in-flight claim key a runner sets when it
-    starts a test. Defaults to 10 minutes. The runner refreshes this TTL
-    every `claim_ttl / 3` seconds while the test is running, so a slow
-    test never lets its claim expire under it.
+    starts a test. Defaults to 3 minutes. Every runner heartbeat (see
+    `MOCHA_DISTRIBUTED_HEARTBEAT_INTERVAL`) refreshes the TTL of every claim
+    the runner holds, in the same redis round-trip as its check-in, so a
+    claim lives exactly as long as its runner keeps beating: a 5-minute test
+    keeps its 3-minute claim. Values shorter than three heartbeats (90 s by
+    default) are raised to three heartbeats with a warning, so one slow
+    redis call or GC pause can't drop a live claim.
 
     On graceful shutdown (SIGTERM / SIGINT) the runner DELs its in-flight
     claim so a replacement pod can pick the test up immediately. On a hard
@@ -134,7 +138,7 @@ whether a test has already been executed or not by other of their peers.
     A test key in redis goes through three phases:
 
     1. **In-flight** — short TTL (`MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME`),
-       refreshed by a keepalive while the test runs. A serial group's
+       refreshed by every runner heartbeat while held. A serial group's
        shared key stays in-flight from its first test until its last one,
        even while the runner executes unrelated tests in between (a group
        may span several suites and files).
@@ -198,7 +202,8 @@ whether a test has already been executed or not by other of their peers.
     time (ms since epoch), and removes itself on graceful exit or SIGTERM.
     A runner counts as live while its last check-in is within three
     intervals (90 s by default); a hard-killed runner (OOM, spot reclaim)
-    simply ages out. Count live runners with
+    simply ages out. Each beat also refreshes the runner's held claims
+    (see `MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME`). Count live runners with
     `ZCOUNT {execId}:runners_heartbeat <now - 90000> +inf`; the drain
     status line reports this figure. The older `{execId}:runners_active`
     counter is still written, but only decrements on graceful exit, so it

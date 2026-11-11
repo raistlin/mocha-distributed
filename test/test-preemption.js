@@ -136,6 +136,7 @@ function makeMockClient(opts = {}) {
         sAdd:   (...a) => { cmds.push(['sAdd',   ...a]); return chain; },
         exists: (...a) => { cmds.push(['exists', ...a]); return chain; },
         hSet:   (...a) => { cmds.push(['hSet',   ...a]); return chain; },
+        zAdd:   (...a) => { cmds.push(['zAdd',   ...a]); return chain; },
         exec: async () => {
           calls.push(['multi', cmds.slice()]);
           // beforeEach pipeline: SET NX + GET (+ sAdd/expire on universe).
@@ -180,6 +181,12 @@ function makeMockClient(opts = {}) {
               results.push(members.flat().length);
             } else if (cmd[0] === 'exists') {
               results.push(kv.has(cmd[1]) ? 1 : 0);
+            } else if (cmd[0] === 'zAdd') {
+              const [, zk, { score, value }] = cmd;
+              const obj = kv.has(zk) ? JSON.parse(kv.get(zk)) : {};
+              obj[value] = score;
+              kv.set(zk, JSON.stringify(obj));
+              results.push(1);
             } else if (cmd[0] === 'hSet') {
               const [, hk, field, value] = cmd;
               const obj = kv.has(hk) ? JSON.parse(kv.get(hk)) : {};
@@ -242,11 +249,19 @@ function findSetCmd(calls) {
   return null;
 }
 
+// Claim refreshes for `key` with `ttl` among `calls`: the heartbeat sends
+// them inside its pipeline, other paths as plain EXPIREs.
+function claimRefreshes(calls, key, ttl) {
+  return calls
+    .flatMap(c => (c[0] === 'multi' ? c[1] : [c]))
+    .filter(c => c[0] === 'expire' && c[1] === key && String(c[2]) === ttl);
+}
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 const LONG_TTL  = `${7 * 24 * 3600}`;
-const SHORT_TTL = `${10 * 60}`;
+const SHORT_TTL = `${3 * 60}`;
 
 describe('mocha-distributed preemption resilience', function () {
 
@@ -286,7 +301,7 @@ describe('mocha-distributed preemption resilience', function () {
       assert.strictEqual(runnerId, 'runner-ttl');
       assert.strictEqual(setOpts.NX, true, 'SET NX flag set');
       assert.strictEqual(String(setOpts.EX), SHORT_TTL,
-        'claim TTL is the short value (default 600s)');
+        'claim TTL is the short value (default 180s)');
 
       // Tombstone: a direct (non-multi) expire on the claim key with the
       // long TTL must have been called after the test completed.
@@ -332,6 +347,49 @@ describe('mocha-distributed preemption resilience', function () {
       assert.ok(setCmd);
       assert.strictEqual(String(setCmd[3].EX), '120',
         'claim TTL honours env override');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  describe('claim TTL shorter than three heartbeats', function () {
+    // The heartbeat refreshes claims; a TTL under three beats would let one
+    // slow redis call or GC pause drop a live claim. Same rule as the
+    // live-runner window, so it is clamped up with a warning.
+    let client, lib, warnings, realWarn;
+
+    before(function () {
+      client = makeMockClient();
+      injectMockRedis(client);
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'pre-exec-clamp';
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-clamp';
+      process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME = '60';
+      delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
+      warnings = [];
+      realWarn = console.warn;
+      console.warn = (...args) => { warnings.push(args.join(' ')); };
+      try { lib = loadFreshLib(); } finally { console.warn = realWarn; }
+    });
+
+    after(function () {
+      delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
+      restoreRedis();
+      clearLib();
+    });
+
+    it('raises it to three heartbeats and warns', async function () {
+      const m = new Mocha({ reporter: 'min' });
+      m.suite.beforeEach(lib.mochaHooks.beforeEach); m.suite.afterEach(lib.mochaHooks.afterEach);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+      const suite = Suite.create(m.suite, 'clamp-suite');
+      suite.addTest(new Test('passes', function () {}));
+      await new Promise(resolve => m.run(resolve));
+
+      const setCmd = findSetCmd(client.calls);
+      assert.strictEqual(String(setCmd[3].EX), '90', 'claim TTL clamped to 3 x 30 s');
+      assert.ok(warnings.some(w => /CLAIM_EXPIRATION_TIME/.test(w) && /90/.test(w)),
+        `a warning names the setting and the value used (got ${JSON.stringify(warnings)})`);
     });
   });
 
@@ -413,7 +471,7 @@ describe('mocha-distributed preemption resilience', function () {
   });
 
   // ---------------------------------------------------------------------------
-  describe('keepalive refresh during a running test', function () {
+  describe('heartbeat refreshes the claim during a running test', function () {
     let client, lib;
     let realSetInterval, capturedInterval;
 
@@ -443,7 +501,7 @@ describe('mocha-distributed preemption resilience', function () {
       clearLib();
     });
 
-    it('refreshes the claim with the short TTL while the test runs', async function () {
+    it('refreshes the claim with the short TTL on every heartbeat while the test runs', async function () {
       this.timeout(10000);
 
       const m = new Mocha({ reporter: 'min' });
@@ -453,9 +511,9 @@ describe('mocha-distributed preemption resilience', function () {
 
       const suite = Suite.create(m.suite, 'keepalive-suite');
       suite.addTest(new Test('long-running', async function () {
-        // beforeEach has registered the keepalive by now; fire it twice
-        // to simulate the interval firing while the test runs.
-        assert.ok(capturedInterval, 'keepalive setInterval was registered');
+        // globalSetup started the heartbeat; fire it twice to simulate two
+        // beats while the test runs.
+        assert.ok(capturedInterval, 'heartbeat setInterval was registered');
         capturedInterval.fn();
         capturedInterval.fn();
         // Let the awaited expire() promises resolve.
@@ -469,18 +527,14 @@ describe('mocha-distributed preemption resilience', function () {
       const setCmd = findSetCmd(client.calls);
       const testKey = setCmd[1];
 
-      // The interval interval value must be claim_ttl/3 in seconds = 200s
-      // for the default 600s TTL. Allow >= 30s floor, default => 200000ms.
-      assert.strictEqual(capturedInterval.ms, 200 * 1000,
-        'keepalive interval is claim_ttl/3 seconds');
+      // Claims are refreshed at the heartbeat cadence (default 30 s).
+      assert.strictEqual(capturedInterval.ms, 30 * 1000,
+        'claims are refreshed on the heartbeat interval');
 
-      // Two refresh calls with the short TTL must have been recorded.
-      const refreshes = client.calls
-        .slice(callsBefore)
-        .filter(c => c[0] === 'expire' && c[1] === testKey
-                     && String(c[2]) === SHORT_TTL);
+      // Two refreshes with the short TTL must have been recorded.
+      const refreshes = claimRefreshes(client.calls.slice(callsBefore), testKey, SHORT_TTL);
       assert.ok(refreshes.length >= 2,
-        `>=2 keepalive refreshes recorded (got ${refreshes.length})`);
+        `>=2 heartbeat refreshes recorded (got ${refreshes.length})`);
     });
   });
 
@@ -1508,8 +1562,8 @@ describe('mocha-distributed preemption resilience', function () {
           const callsBefore = client.calls.length;
           for (const fn of intervals) fn();
           await new Promise(r => setImmediate(r));
-          refreshedMidGroup = client.calls.slice(callsBefore).some(c =>
-            c[0] === 'expire' && c[1] === groupKey && String(c[2]) === SHORT_TTL);
+          refreshedMidGroup =
+            claimRefreshes(client.calls.slice(callsBefore), groupKey, SHORT_TTL).length > 0;
         }));
         const signup = Suite.create(m.suite, 'Signup Suite [serial-g]');
         signup.addTest(new Test('s1', function () {}));
@@ -1522,7 +1576,7 @@ describe('mocha-distributed preemption resilience', function () {
       assert.strictEqual(tombstonedMidGroup, false,
         'group claim is not tombstoned before its last test runs');
       assert.strictEqual(refreshedMidGroup, true,
-        'group claim keepalive keeps refreshing while an unrelated test runs');
+        'heartbeat keeps refreshing the group claim while an unrelated test runs');
       assert.strictEqual(client.calls.filter(isTombstone).length, 1,
         'group claim is tombstoned once, after its last test');
       assert.ok(doneMembers(client, execId).includes(groupKey),

@@ -21,18 +21,11 @@ const g_redisAddress = process.env.MOCHA_DISTRIBUTED || "";
 const g_testExecutionId = process.env.MOCHA_DISTRIBUTED_EXECUTION_ID || "";
 const g_expirationTime =
   process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME || `${7 * 24 * 3600}`;
-// Short TTL for in-flight claim keys; refreshed by a keepalive while a test
-// runs, DEL'd on SIGTERM, and promoted to g_expirationTime as a tombstone
-// once the test completes. See README "Claim key lifecycle".
-const g_claimExpirationTime =
-  process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME || `${10 * 60}`;
-// Both TTLs come in as strings (env vars) or already-numbers (defaults).
 // Parse once here so every redis call below passes a number and no call
 // site has to remember to parseInt() it — the seemingly-safe raw fallback
 // silently mangled some redis client encoder paths under load (see the
 // integration-run notes later in this file's history).
 const g_expirationTimeSec = parseInt(g_expirationTime, 10) || (7 * 24 * 3600);
-const g_claimExpirationTimeSec = parseInt(g_claimExpirationTime, 10) || (10 * 60);
 
 // Central schema for the fixed-name redis keys used for cross-runner
 // coordination state (as opposed to per-test claim keys, which are built
@@ -74,15 +67,12 @@ let g_capture = { stdout: null, stderr: null };
 // Track the in-flight claim so afterEach can tombstone it once complete.
 let g_currentClaimKey = null;
 
-// Keepalive for every claim this runner holds: a plain test's while it runs,
-// a serial group's from its first test until its last one (the group may
-// span suites and files, so unrelated tests run in between). Refreshed well
-// inside the claim TTL; held claims are DEL'd on SIGTERM and released before
-// drain so a peer can rescue them. See lib/claim-holder.js.
-const g_claimHolder = createClaimHolder({
-  refresh: (key) => g_redis.expire(key, g_claimExpirationTimeSec).catch(() => {}),
-  intervalMs: Math.max(30, Math.floor(g_claimExpirationTimeSec / 3)) * 1000,
-});
+// Every claim this runner holds: a plain test's while it runs, a serial
+// group's from its first test until its last one (the group may span suites
+// and files, so unrelated tests run in between). The runner heartbeat
+// refreshes them on every beat; held claims are DEL'd on SIGTERM and
+// released before drain so a peer can rescue them. See lib/claim-holder.js.
+const g_claimHolder = createClaimHolder();
 
 // Report-collapsing identity for the current test (see g_lastReportKey below
 // for why this can't just be re-derived from this.currentTest in afterEach).
@@ -160,6 +150,23 @@ const g_heartbeatIntervalSec = Math.max(
   parseInt(process.env.MOCHA_DISTRIBUTED_HEARTBEAT_INTERVAL || "30", 10) || 30
 );
 const g_liveRunnerWindowMs = 3 * g_heartbeatIntervalSec * 1000;
+
+// Short TTL for in-flight claim keys; refreshed by every heartbeat while
+// the claim is held, DEL'd on SIGTERM, and promoted to g_expirationTime as a
+// tombstone once the test completes. See README "Claim key lifecycle".
+// Never shorter than three heartbeats, the same tolerance as the live-runner
+// window: one slow redis call or GC pause must not drop a live claim.
+const g_claimExpirationTimeSec = (() => {
+  const requested =
+    parseInt(process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME || "180", 10) || 180;
+  const floor = 3 * g_heartbeatIntervalSec;
+  if (requested >= floor) return requested;
+  console.warn(
+    `[mocha-distributed] MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME=${requested}s ` +
+    `is shorter than three heartbeats; using ${floor}s`
+  );
+  return floor;
+})();
 
 // Cache errors from intermediate retry attempts. Mocha only sets test.err via
 // the reporter on the final EVENT_TEST_FAIL; for non-final retries it emits
@@ -1147,6 +1154,8 @@ exports.mochaGlobalSetup = async function () {
     runnerId: g_runnerId,
     intervalMs: g_heartbeatIntervalSec * 1000,
     ttlSec: g_expirationTimeSec,
+    heldClaims: () => g_claimHolder.heldKeys(),
+    claimTtlSec: g_claimExpirationTimeSec,
   });
   await g_heartbeat.start();
 };
@@ -1397,7 +1406,7 @@ exports.mochaHooks = {
     const universeKey = redisKeys.testUniverse();
     const [_, assignedRunnerId] = await g_redis
       .multi()
-      .set(testKey, g_runnerId, { EX: g_claimExpirationTime, NX: true })
+      .set(testKey, g_runnerId, { EX: g_claimExpirationTimeSec, NX: true })
       .get(testKey)
       .sAdd(universeKey, testKey)
       .expire(universeKey, g_expirationTimeSec)
@@ -1413,9 +1422,10 @@ exports.mochaHooks = {
     } else {
       g_currentClaimKey = testKey;
       g_currentReportKey = reportKey;
-      // Keep the claim alive so a slow test (or a serial group running
-      // unrelated tests between its members) never lets its TTL expire
-      // while we still own it. Idempotent for a group already held.
+      // Hold the claim so every heartbeat refreshes it: a slow test (or a
+      // serial group running unrelated tests between its members) never
+      // lets its TTL expire while we still own it. Idempotent for a group
+      // already held.
       g_claimHolder.hold(testKey);
       g_capture.stdout = captureStream(process.stdout);
       g_capture.stderr = captureStream(process.stderr);
@@ -1588,9 +1598,10 @@ exports.mochaHooks = {
       } catch (_) {}
     }
 
-    // Once the claim is complete, stop its keepalive and promote it to a
-    // tombstone matching the result-list lifetime, so a replacement pod
-    // won't re-run a test that already produced a result. An unfinished
+    // Once the claim is complete, stop holding it (no more heartbeat
+    // refreshes) and promote it to a tombstone matching the result-list
+    // lifetime, so a replacement pod won't re-run a test that already
+    // produced a result. An unfinished
     // serial group keeps its short, refreshed claim until its last test.
     if (g_currentClaimKey && claimComplete) {
       g_claimHolder.release(g_currentClaimKey);
@@ -1609,7 +1620,7 @@ exports.mochaHooks = {
 // On SIGTERM (e.g. GKE spot preemption), release every held claim (the
 // in-flight test's and any unfinished serial group's) so a replacement pod
 // can re-run the interrupted tests. Without this the claims would sit locked
-// until g_claimExpirationTime, blocking recovery.
+// until the claim TTL expires, blocking recovery.
 // -----------------------------------------------------------------------------
 async function releaseClaimAndExit(signal) {
   try {

@@ -217,7 +217,9 @@ whether a test has already been executed or not by other of their peers.
     runner (CAS-guarded) writes a synthetic failed row for it to
     `test_result`, bumps `failed_count`, marks it done, and the drain
     loop can finally converge. A serial group counts as one rescue per
-    pick-up, however many tests it contains.
+    pick-up, however many tests it contains. Only the runner that wins the
+    claim spends the budget: several drain runners racing on the same
+    orphan make one rescue, not one each.
 
   - **MOCHA_DISTRIBUTED_EXPECTED_TOTAL_OVERRIDE** (unset by default)
 

@@ -643,6 +643,30 @@ async function handleRescueCap(testKey, currentTest, attempts) {
 }
 
 // -----------------------------------------------------------------------------
+// rescueBudgetExhausted
+//
+// Drain-phase rescue budget, spent only by the runner that won the claim:
+// several drain runners racing on the same orphan make one rescue, not one
+// each (counting every try once tripped the cap while the winner was
+// running the test fine). Over budget, the test is declared broken: write
+// the synthetic failure via the CAS-guarded handler and tombstone our claim
+// like a completed one, so nobody claims it again.
+// -----------------------------------------------------------------------------
+async function rescueBudgetExhausted(testKey, currentTest) {
+  try {
+    const rcKey = redisKeys.rescueCount(testKey);
+    const attempts = await g_redis.incr(rcKey);
+    await g_redis.expire(rcKey, g_expirationTimeSec);
+    if (attempts <= g_maxRescuesPerTest) return false;
+    await handleRescueCap(testKey, currentTest, attempts);
+    await g_redis.expire(testKey, g_expirationTimeSec);
+    return true;
+  } catch (_) {
+    return false; // best-effort; run the test rather than lose it
+  }
+}
+
+// -----------------------------------------------------------------------------
 // sleep
 //
 // Await-friendly sleep used by the drain-phase poll loop.
@@ -1357,24 +1381,10 @@ exports.mochaHooks = {
     const testKey =
       g_granularity === GRANULARITY.TEST ? testKeyFullPath : testKeySuite;
 
-    // Drain-phase rescue budget: if this runner is in drain (not the
-    // initial iteration), bump the per-test counter and check the cap
-    // before attempting to claim. On cap exhaustion, write a synthetic
-    // failure row via the CAS-guarded handler and skip. A serial group is
-    // one rescue: later members of a group this runner already holds don't
-    // count again.
-    if (g_drainPhase && !g_claimHolder.isHeld(testKey)) {
-      try {
-        const rcKey = redisKeys.rescueCount(testKey);
-        const attempts = await g_redis.incr(rcKey);
-        await g_redis.expire(rcKey, g_expirationTimeSec);
-        if (attempts > g_maxRescuesPerTest) {
-          await handleRescueCap(testKey, this.currentTest, attempts);
-          this.currentTest.title += ' (rescue budget exhausted)';
-          return this.skip();
-        }
-      } catch (_) { /* best-effort; fall through to normal claim */ }
-    }
+    // A serial group is one rescue: later members of a group this runner
+    // already holds don't spend the budget again. Read before claiming,
+    // since the claim below holds the key.
+    const alreadyHeld = g_claimHolder.isHeld(testKey);
 
     // Atomically set/get the runner id associated to this test. Only the first
     // runner to get there will set the value to its own runner id.
@@ -1396,6 +1406,10 @@ exports.mochaHooks = {
     if (assignedRunnerId !== g_runnerId) {
       this.currentTest.title += " (skipped by mocha_distributted)";
       this.skip();
+    } else if (g_drainPhase && !alreadyHeld &&
+               await rescueBudgetExhausted(testKey, this.currentTest)) {
+      this.currentTest.title += ' (rescue budget exhausted)';
+      return this.skip();
     } else {
       g_currentClaimKey = testKey;
       g_currentReportKey = reportKey;

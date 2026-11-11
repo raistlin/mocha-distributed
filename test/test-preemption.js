@@ -143,14 +143,18 @@ function makeMockClient(opts = {}) {
           // (e.g. the SIGTERM ownership check) see the correct owner.
           if (cmds[0] && cmds[0][0] === 'set') {
             const testKey = cmds[0][1];
-            const owner = claimOwners[testKey] ||
-                          process.env.MOCHA_DISTRIBUTED_RUNNER_ID;
+            const owner = claimOwners[testKey] || cmds[0][2];
             // Preempted keys stay unclaimable so drain can observe them as
             // orphans: the SET NX 'succeeds' from the caller's perspective
             // but no live claim key is stored (and EXISTS returns 0).
             if (!preemptedKeys.has(testKey) && !kv.has(testKey)) {
               kv.set(testKey, owner);
             }
+            // GET after SET NX returns whoever really holds the claim, so a
+            // peer that loses the race sees the winner's id (shared-redis
+            // tests run several runners against one mock client).
+            const holder = (!preemptedKeys.has(testKey) && !claimOwners[testKey]
+                            && kv.has(testKey)) ? kv.get(testKey) : owner;
             // Apply any sAdd commands piggybacked on the same pipeline so
             // the shared state (test_universe) reflects them for later
             // drain-phase reads.
@@ -162,7 +166,7 @@ function makeMockClient(opts = {}) {
                 kv.set(sk, JSON.stringify([...existing]));
               }
             }
-            return [null, owner, ...cmds.slice(2).map(() => 1)];
+            return [null, holder, ...cmds.slice(2).map(() => 1)];
           }
           // afterEach / drain pipelines: apply sAdd and exists to shared
           // state so drain iterations converge correctly against the mock.
@@ -1348,6 +1352,81 @@ describe('mocha-distributed preemption resilience', function () {
         'exactly one synthetic row across repeated cap-hits (CAS holds)');
 
       lib2.__testing.setDrainPhase(false);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  describe('drain runners racing on one orphan', function () {
+    // Several runners enter drain at the same moment and all see the same
+    // orphan. Only the one that wins its claim actually rescues it, so only
+    // that one may spend the test's rescue budget. Counting every runner
+    // that merely tried tripped the cap (5 tries > 3) and wrote a synthetic
+    // "orphaned" failure while the winner was running the test fine.
+    const RUNNERS = 5;
+    const execId = 'pre-exec-race';
+    // The hand-built root suite has an empty title, hence the empty segment.
+    const orphanKey = `${execId}::race-suite:orphan:dup-1`;
+
+    afterEach(function () {
+      restoreRedis();
+      clearLib();
+    });
+
+    it('spends one rescue, writes no synthetic failure, and lets only the winner run it', async function () {
+      this.timeout(10000);
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = execId;
+      process.env.MOCHA_DISTRIBUTED_DRAIN_ENABLED = 'false';
+      delete process.env.MOCHA_DISTRIBUTED_MAX_RESCUES_PER_TEST;
+      delete process.env.MOCHA_DISTRIBUTED_CLAIM_EXPIRATION_TIME;
+      delete process.env.MOCHA_DISTRIBUTED_EXPIRATION_TIME;
+      const client = makeMockClient();
+      injectMockRedis(client);
+
+      // One fresh copy of the lib per runner: each has its own runner id
+      // and module state, all sharing the same redis.
+      const runners = [];
+      for (let i = 0; i < RUNNERS; i++) {
+        process.env.MOCHA_DISTRIBUTED_RUNNER_ID = `runner-race-${i}`;
+        delete require.cache[require.resolve('../index.js')];
+        const lib = require('../index.js');
+        // globalSetup only needs the root suite to build its test keys;
+        // driving it directly avoids running five Mocha instances.
+        const root = new Suite('', null);
+        const suite = Suite.create(root, 'race-suite');
+        const test = new Test('orphan', function () {});
+        suite.addTest(test);
+        await lib.mochaGlobalSetup.call({ suite: root, on() {} });
+        runners.push({ lib, test });
+      }
+      assert.strictEqual(client.kv.has(orphanKey), false, 'nobody holds the orphan yet');
+
+      // All runners hit the orphan's beforeEach at once, as in drain.
+      const skipped = await Promise.all(runners.map(async ({ lib, test }) => {
+        lib.__testing.setDrainPhase(true);
+        let wasSkipped = false;
+        await lib.mochaHooks.beforeEach.call({ currentTest: test, skip() { wasSkipped = true; } });
+        lib.__testing.setDrainPhase(false);
+        return wasSkipped;
+      }));
+
+      // The winner runs the test and finishes it.
+      const winner = runners[skipped.indexOf(false)];
+      if (winner) {
+        winner.test.state = 'passed';
+        await winner.lib.mochaHooks.afterEach.call({ currentTest: winner.test });
+      }
+
+      assert.strictEqual(skipped.filter(s => !s).length, 1, 'exactly one runner rescues the orphan');
+      assert.strictEqual(client.kv.get(`${execId}:rescue_count:${orphanKey}`), '1',
+        'only the claim winner spends the rescue budget');
+      assert.strictEqual(client.kv.has(`${execId}:cap_hit_marker:${orphanKey}`), false,
+        'the rescue cap was not hit');
+      const synthetic = client.calls.filter(c => c[0] === 'multi')
+        .flatMap(c => c[1])
+        .filter(cmd => cmd[0] === 'rPush' && cmd[1] === `${execId}:test_result`)
+        .filter(cmd => JSON.parse(cmd[2]).syntheticOrphan === true);
+      assert.strictEqual(synthetic.length, 0, 'no synthetic orphan failure was written');
     });
   });
 

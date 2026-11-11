@@ -39,10 +39,13 @@ function makeFakeRedis(clock = { now: 0 }) {
       const hi = max === '+inf' ? Infinity : Number(max);
       return [...zset(k).values()].filter(s => s >= lo && s <= hi).length;
     },
-    expire: async (k, ttl) => {
+    // Honours EXPIRE's GT mode: only ever extends a key's current expiry.
+    expire: async (k, ttl, mode) => {
       ttls.set(k, ttl);
       if (!alive(k)) return 0;
-      if (keys.has(k)) keys.set(k, clock.now + ttl * 1000);
+      const expireAt = clock.now + ttl * 1000;
+      if (mode === 'GT' && keys.has(k) && expireAt <= keys.get(k)) return 0;
+      if (keys.has(k)) keys.set(k, expireAt);
       return 1;
     },
     multi: () => {
@@ -183,6 +186,20 @@ describe('runner heartbeat', function () {
     clock.now += 181000;
     await timers.tick();
     assert.strictEqual(await redis.exists('claim-slow'), 0, 'claim expires once nobody refreshes it');
+  });
+
+  it('never shortens a claim that its test already made permanent', async function () {
+    // The test finishes and tombstones its claim for 7 days while a beat
+    // that still lists it as held is on its way to redis.
+    const clock = { now: 0 };
+    const redis = makeFakeRedis(clock);
+    const heartbeat = makeHeartbeat(redis, makeFakeTimers(), clock, () => ['claim-done']);
+
+    redis.setKey('claim-done', 7 * 24 * 3600);
+    await heartbeat.start();
+
+    clock.now += 181000;
+    assert.strictEqual(await redis.exists('claim-done'), 1, 'tombstone keeps its 7-day TTL');
   });
 
   it('reads the held claims afresh on every beat', async function () {

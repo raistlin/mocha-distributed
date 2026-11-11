@@ -126,7 +126,10 @@ whether a test has already been executed or not by other of their peers.
     claim lives exactly as long as its runner keeps beating: a 5-minute test
     keeps its 3-minute claim. Values shorter than three heartbeats (90 s by
     default) are raised to three heartbeats with a warning, so one slow
-    redis call or GC pause can't drop a live claim.
+    redis call or GC pause can't drop a live claim. The refresh uses
+    `EXPIRE ... GT`, so it only ever extends a claim and never cuts a
+    completed test's long tombstone TTL back to the claim TTL. This needs
+    Redis 7 or later.
 
     On graceful shutdown (SIGTERM / SIGINT) the runner DELs its in-flight
     claim so a replacement pod can pick the test up immediately. On a hard

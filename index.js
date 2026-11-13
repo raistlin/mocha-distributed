@@ -1242,6 +1242,23 @@ exports.mochaGlobalTeardown = async function () {
 // complete while later tests still have to run if the owner gets preempted
 // mid-group.
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// willBeRetried
+//
+// True when this attempt failed and mocha is going to run the test again
+// (its runner retries while currentRetry < retries(); retries() is -1 or 0
+// when the test has none). Such an attempt is not the test's outcome:
+// afterEach records it, but leaves the counters, done_tests and the claim to
+// the final attempt. Otherwise the drain sees the test as done while its retry
+// is still running and every runner exits with failures, which tears the Job
+// down and kills the retry.
+// -----------------------------------------------------------------------------
+function willBeRetried(test, failed) {
+  if (!failed) return false;
+  const retries = typeof test.retries === "function" ? test.retries() : test._retries;
+  return (test._currentRetry || 0) < (retries ?? -1);
+}
+
 function isClaimComplete(test) {
   const info = g_testKeyInfo.get(test);
   if (info) return !info.isSerial || info.isLastInSerialGroup;
@@ -1437,6 +1454,7 @@ exports.mochaHooks = {
     const FAILED = "failed";
     const PASSED = "passed";
     const claimComplete = isClaimComplete(this.currentTest);
+    let willRetry = false;
 
     let capturedStdout = "";
     let capturedStderr = "";
@@ -1473,6 +1491,7 @@ exports.mochaHooks = {
       ) {
         stateFixed = FAILED;
       }
+      willRetry = willBeRetried(this.currentTest, stateFixed === FAILED);
 
       // Error objects cannot be properly serialized with stringify, thus
       // we need to use this hack to make it look like a normal object.
@@ -1571,15 +1590,18 @@ exports.mochaHooks = {
       let pipe = g_redis
         .multi()
         .rPush(resultKey, JSON.stringify(testResult))
-        .expire(resultKey, g_expirationTimeSec)
-        .incr(countKey)
-        .expire(countKey, g_expirationTimeSec);
+        .expire(resultKey, g_expirationTimeSec);
+      if (!willRetry) {
+        pipe = pipe
+          .incr(countKey)
+          .expire(countKey, g_expirationTimeSec);
+      }
       if (reportRow) {
         pipe = pipe
           .hSet(reportRedisKey, g_currentReportKey, JSON.stringify(reportRow))
           .expire(reportRedisKey, g_expirationTimeSec);
       }
-      if (claimComplete && g_currentClaimKey) {
+      if (claimComplete && g_currentClaimKey && !willRetry) {
         pipe = pipe
           .sAdd(doneKey, g_currentClaimKey)
           .expire(doneKey, g_expirationTimeSec);
@@ -1602,8 +1624,9 @@ exports.mochaHooks = {
     // refreshes) and promote it to a tombstone matching the result-list
     // lifetime, so a replacement pod won't re-run a test that already
     // produced a result. An unfinished
-    // serial group keeps its short, refreshed claim until its last test.
-    if (g_currentClaimKey && claimComplete) {
+    // serial group keeps its short, refreshed claim until its last test, and
+    // a test about to be retried keeps it until its final attempt.
+    if (g_currentClaimKey && claimComplete && !willRetry) {
       g_claimHolder.release(g_currentClaimKey);
       try {
         await g_redis.expire(g_currentClaimKey, g_expirationTimeSec);

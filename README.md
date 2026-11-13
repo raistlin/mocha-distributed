@@ -151,7 +151,9 @@ whether a test has already been executed or not by other of their peers.
     3. **Completed** — promoted to a tombstone with TTL
        `MOCHA_DISTRIBUTED_EXPIRATION_TIME` (7 d default), matching the
        result-list lifetime, and added to `done_tests`. A claimed test that
-       skips itself at runtime (`this.skip()`) also counts as completed.
+       skips itself at runtime (`this.skip()`) also counts as completed. A
+       failed attempt that mocha is going to retry does not complete the
+       claim: the runner keeps holding it until the test's final attempt.
 
     This makes the runner safe to use on preemptible / spot infrastructure.
 
@@ -301,7 +303,10 @@ Keep in mind that:
 * Duration and start/end times are in milliseconds.
 * Some fields are duplicated in a way, like "state" and "failed" by design
   because sometimes is handy to have this when reading results back.
-* You can access test_result, passed_count and failed_count in redis
+* You can access test_result, passed_count and failed_count in redis.
+  test_result has one row per attempt (retries included), while
+  passed_count and failed_count count each test once, by its final attempt:
+  a test that fails and then passes on retry counts as passed.
 * Skipped tests are never saved in redis by design, unfortunately
 * `reportKey` is the field name for this test in the collapsed `{execId}:report`
   hash (see below) — use it directly with `HGET {execId}:report <reportKey>`

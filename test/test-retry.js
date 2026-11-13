@@ -18,7 +18,7 @@ const Test   = require('mocha/lib/test');
 // -----------------------------------------------------------------------------
 const redisResolved = require.resolve('redis');
 
-const mockMulti = (writtenResults, reportHash) => () => {
+const mockMulti = (writtenResults, reportHash, calls) => () => {
   const cmds = [];
   const chain = {
     set:    (...a) => { cmds.push(['set',    ...a]); return chain; },
@@ -37,6 +37,7 @@ const mockMulti = (writtenResults, reportHash) => () => {
       return chain;
     },
     exec: async () => {
+      if (calls) calls.pipelines.push(cmds.slice());
       // beforeEach pipeline: SET NX + GET (+ optional universe SADD/EXPIRE)
       if (cmds[0] && cmds[0][0] === 'set') {
         return [null, process.env.MOCHA_DISTRIBUTED_RUNNER_ID,
@@ -49,7 +50,7 @@ const mockMulti = (writtenResults, reportHash) => () => {
   return chain;
 };
 
-function injectMockRedis(writtenResults, reportHash) {
+function injectMockRedis(writtenResults, reportHash, calls) {
   require.cache[redisResolved] = {
     id:       redisResolved,
     filename: redisResolved,
@@ -65,10 +66,10 @@ function injectMockRedis(writtenResults, reportHash) {
         set:     async () => 'OK',
         incr:    async () => 1,
         decr:    async () => 0,
-        expire:  async () => 1,
+        expire:  async (...a) => { if (calls) calls.expires.push(a); return 1; },
         del:     async () => 1,
         hGet:    async (key, field) => (reportHash.has(field) ? reportHash.get(field) : null),
-        multi:   mockMulti(writtenResults, reportHash),
+        multi:   mockMulti(writtenResults, reportHash, calls),
       })
     },
   };
@@ -251,6 +252,121 @@ describe('mocha-distributed', function () {
       assert.ok(row.attempts[0].err && row.attempts[0].err.message.includes('fails on first attempt'));
       assert.strictEqual(row.attempts[1].retryAttempt, 1);
       assert.strictEqual(row.attempts[1].state, 'passed');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // An attempt that mocha is going to retry is not the test's outcome: it must
+  // not be counted as a failure, mark the test done, or give up the claim.
+  // Otherwise the drain sees the test as done while its retry is still
+  // running, every runner exits with failures and the Job is torn down, killing
+  // the retry (run manual-kg892, 2026-11-13).
+  // ---------------------------------------------------------------------------
+  describe('attempts that will be retried', function () {
+    let writtenResults;
+    let reportHash;
+    let calls;
+    let lib;
+
+    before(function () {
+      writtenResults = [];
+      reportHash = new Map();
+      calls = { pipelines: [], expires: [] };
+      injectMockRedis(writtenResults, reportHash, calls);
+
+      process.env.MOCHA_DISTRIBUTED              = 'redis://mock';
+      process.env.MOCHA_DISTRIBUTED_EXECUTION_ID = 'test-exec-final';
+      process.env.MOCHA_DISTRIBUTED_RUNNER_ID    = 'runner-test';
+      process.env.MOCHA_DISTRIBUTED_DRAIN_ENABLED = 'false';
+
+      lib = loadFreshLib();
+    });
+
+    after(function () {
+      restoreRedis();
+      delete require.cache[require.resolve('../index.js')];
+    });
+
+    beforeEach(function () {
+      writtenResults.length = 0;
+      reportHash.clear();
+      calls.pipelines.length = 0;
+      calls.expires.length = 0;
+    });
+
+    const run = async (title, retries, failingAttempts) => {
+      const m = new Mocha({ reporter: 'min' });
+      m.rootHooks(lib.mochaHooks);
+      m.globalSetup([lib.mochaGlobalSetup]);
+      m.globalTeardown([lib.mochaGlobalTeardown]);
+      const suite = Suite.create(m.suite, 'final-suite');
+      suite.retries(retries);
+      let attempt = 0;
+      suite.addTest(new Test(title, function () {
+        attempt++;
+        if (attempt <= failingAttempts) throw new Error('fails on attempt ' + attempt);
+      }));
+      await new Promise(resolve => m.run(resolve));
+    };
+
+    const commands = (name, keySuffix) => calls.pipelines
+      .flat()
+      .filter(c => c[0] === name && String(c[1]).endsWith(keySuffix));
+    const claimKeyOf = title => `test-exec-final:final-suite:${title}:dup-1`;
+    const tombstones = title => calls.expires.filter(a => a[0] === claimKeyOf(title));
+
+    it('counts only the final outcome of a test that passes on retry', async function () {
+      this.timeout(10000);
+      await run('passes-on-retry', 2, 1);
+
+      assert.deepStrictEqual(commands('incr', '_count').map(c => c[1]),
+        ['test-exec-final:passed_count'], 'one count, for the passing attempt');
+    });
+
+    it('marks a test done only after its final attempt', async function () {
+      this.timeout(10000);
+      await run('passes-on-retry-2', 2, 2);
+
+      assert.strictEqual(commands('sAdd', ':done_tests').length, 1, 'done once');
+      const lastPipeline = calls.pipelines[calls.pipelines.length - 1];
+      assert.ok(lastPipeline.some(c => c[0] === 'sAdd' && String(c[1]).endsWith(':done_tests')),
+        'done is written with the final attempt');
+    });
+
+    it('keeps holding the claim until the final attempt', async function () {
+      this.timeout(10000);
+      await run('passes-on-retry-3', 2, 1);
+
+      assert.strictEqual(tombstones('passes-on-retry-3').length, 1,
+        'the claim becomes a tombstone once, after the passing attempt');
+    });
+
+    it('counts a test that fails every attempt as one failure, done once', async function () {
+      this.timeout(10000);
+      await run('always-fails', 2, 3);
+
+      assert.deepStrictEqual(commands('incr', '_count').map(c => c[1]),
+        ['test-exec-final:failed_count'], 'one failure, for the last attempt');
+      assert.strictEqual(commands('sAdd', ':done_tests').length, 1, 'done once');
+      assert.strictEqual(tombstones('always-fails').length, 1, 'tombstoned once');
+    });
+
+    it('still records every attempt in test_result and the report', async function () {
+      this.timeout(10000);
+      await run('passes-on-retry-4', 2, 2);
+
+      assert.strictEqual(writtenResults.length, 3, 'one test_result row per attempt');
+      const row = JSON.parse(Array.from(reportHash.values())[0]);
+      assert.deepStrictEqual(row.attempts.map(a => a.state), ['failed', 'failed', 'passed']);
+    });
+
+    it('treats a test without retries as final on its first attempt', async function () {
+      this.timeout(10000);
+      await run('no-retries', 0, 1);
+
+      assert.deepStrictEqual(commands('incr', '_count').map(c => c[1]),
+        ['test-exec-final:failed_count']);
+      assert.strictEqual(commands('sAdd', ':done_tests').length, 1);
     });
   });
 });
